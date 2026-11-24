@@ -21,24 +21,24 @@ delivers the query plan as a parameter to BE nodes, and then obtains data result
 
 ## Options
 
-| name                    | type    | required | default value     |
-|-------------------------|---------|----------|-------------------|
-| nodeUrls                | list    | yes      | -                 |
-| username                | string  | yes      | -                 |
-| password                | string  | yes      | -                 |
-| database                | string  | yes      | -                 |
-| table                   | string  | no       | -                 |
-| scan_filter             | string  | no       | -                 |
-| schema                  | config  | yes      | -                 |
-| table_list              | array   | no       | -                 |
-| request_tablet_size     | int     | no       | Integer.MAX_VALUE |
-| scan_connect_timeout_ms | int     | no       | 30000             |
-| scan_query_timeout_sec  | int     | no       | 3600              |
-| scan_keep_alive_min     | int     | no       | 10                |
-| scan_batch_rows         | int     | no       | 1024              |
-| scan_mem_limit          | long    | no       | 2147483648        |
-| max_retries             | int     | no       | 3                 |
-| scan.params.*           | string  | no       | -                 |
+| name                    | type   | required | default value     | description                                                                                             |
+|-------------------------|--------|----------|-------------------|---------------------------------------------------------------------------------------------------------|
+| nodeUrls                | list   | yes      | -                 | StarRocks FE HTTP addresses, format: `["fe_ip:fe_http_port", ...]`.                                     |
+| username                | string | yes      | -                 | StarRocks username.                                                                                     |
+| password                | string | yes      | -                 | StarRocks password.                                                                                     |
+| database                | string | yes      | -                 | StarRocks database name.                                                                                |
+| table                   | string | no       | -                 | StarRocks table name. Required when `table_list` is not configured.                                      |
+| table_list              | array  | no       | -                 | Tables to read. Required when `table` is not configured. Each entry can define its own `schema` and filter. |
+| schema                  | config | no       | -                 | Output schema. Configure it at the top level for `table`, or inside each `table_list` entry for multi-table reads. |
+| scan_filter             | string | no       | ""                | Source-side filter expression passed to StarRocks.                                                      |
+| request_tablet_size     | int    | no       | Integer.MAX_VALUE | Maximum tablets in one SeaTunnel split. Smaller values create more splits.                              |
+| scan_connect_timeout_ms | int    | no       | 1000              | Timeout in milliseconds when connecting to StarRocks BE for scan.                                       |
+| scan_query_timeout_sec  | int    | no       | 3600              | Query timeout in seconds. `-1` means no timeout.                                                        |
+| scan_keep_alive_min     | int    | no       | 10                | Keep-alive time of the query task, in minutes.                                                          |
+| scan_batch_rows         | int    | no       | 1024              | Maximum rows read from BE in one batch.                                                                 |
+| scan_mem_limit          | long   | no       | 1073741824        | Maximum memory allowed for a single BE query, in bytes.                                                 |
+| max_retries             | int    | no       | 3                 | Number of retry requests sent to StarRocks.                                                             |
+| scan.params.*           | string | no       | -                 | Extra BE scan parameters. The prefix `scan.params.` is removed before sending parameters to StarRocks.   |
 
 ### nodeUrls [list]
 
@@ -46,19 +46,21 @@ delivers the query plan as a parameter to BE nodes, and then obtains data result
 
 ### username [string]
 
-`StarRocks` user username
+`StarRocks` user username.
 
 ### password [string]
 
-`StarRocks` user password
+`StarRocks` user password.
 
 ### database [string]
 
-The name of StarRocks database
+The name of StarRocks database.
 
 ### table [string]
 
-The name of StarRocks table
+The name of StarRocks table. Configure either `table` or `table_list`.
+
+When `table` is used, configure the source schema at the same level. When `table_list` is used, configure `schema` inside each table item.
 
 ### scan_filter [string]
 
@@ -74,7 +76,11 @@ e.g.
 
 #### fields [Config]
 
-The schema of the starRocks that you want to generate. For more details, please refer to [Schema Feature](../../introduction/concepts/schema-feature.md).
+The schema of the StarRocks rows that SeaTunnel will emit. For more details, please refer to [Schema Feature](../../introduction/concepts/schema-feature.md).
+
+When a boolean value returned by StarRocks is declared as `TINYINT` in the source schema,
+SeaTunnel converts `false` to `0` and `true` to `1` as byte values, preserving `null`.
+Declaring the field as `BOOLEAN` preserves boolean values.
 
 e.g.
 
@@ -89,7 +95,8 @@ schema {
 
 ### table_list [array]
 
-The list of tables to be read, you can use this configuration instead of `table`
+The list of tables to be read. Use this configuration instead of `table` when one job needs to read multiple StarRocks tables.
+Each table item supports `table`, `schema`, and `scan_filter`.
 
 ### request_tablet_size [int]
 
@@ -122,7 +129,7 @@ partition[5] read data of tablet[14, 15] from be_node_3
 
 ### scan_connect_timeout_ms [int]
 
-requests connection timeout sent to StarRocks
+Connection timeout in milliseconds for requests sent to StarRocks. See the options table for the default value.
 
 ### scan_query_timeout_sec [int]
 
@@ -138,7 +145,7 @@ The maximum number of data rows to read from BE at a time. Increasing this value
 
 ### scan_mem_limit [long]
 
-The maximum memory space allowed for a single query in the BE node, in bytes. The default value is 2147483648 (2 GB).
+The maximum memory space allowed for a single query in the BE node, in bytes. See the options table for the default value.
 
 ### max_retries [int]
 
@@ -154,8 +161,8 @@ The parameter of the scan data from be
 source {
   StarRocks {
     nodeUrls = ["starrocks_e2e:8030"]
-    username = root
-    password = ""
+    username = "root"
+    password = "secret"
     database = "test"
     table = "e2e_table_source"
     scan_batch_rows = 10
@@ -190,8 +197,8 @@ source {
 source {
   StarRocks {
     nodeUrls = ["starrocks_e2e:8030"]
-    username = root
-    password = ""
+    username = "root"
+    password = "secret"
     database = "test"
     table_list = [
     {

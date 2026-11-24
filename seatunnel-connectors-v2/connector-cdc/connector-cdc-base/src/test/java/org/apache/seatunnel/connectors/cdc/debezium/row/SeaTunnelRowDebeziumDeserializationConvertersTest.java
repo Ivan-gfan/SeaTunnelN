@@ -19,6 +19,7 @@ package org.apache.seatunnel.connectors.cdc.debezium.row;
 
 import org.apache.seatunnel.api.table.type.ArrayType;
 import org.apache.seatunnel.api.table.type.BasicType;
+import org.apache.seatunnel.api.table.type.LocalTimeType;
 import org.apache.seatunnel.api.table.type.SeaTunnelDataType;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.api.table.type.SeaTunnelRowType;
@@ -36,8 +37,16 @@ import org.junit.jupiter.api.Test;
 
 import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
+import io.debezium.time.MicroTimestamp;
+import io.debezium.time.NanoTimestamp;
+import io.debezium.time.Timestamp;
 
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -80,6 +89,68 @@ public class SeaTunnelRowDebeziumDeserializationConvertersTest {
         SeaTunnelRow row = converters.convert(record, value, schema);
         Assertions.assertEquals(row.getField(0), 1);
         Assertions.assertNull(row.getField(1));
+    }
+
+    @Test
+    void testTimestampConverterBeforeEpoch() throws Exception {
+        // MySQL DATETIME(4-6) arrives as MicroTimestamp; pre-1970 values are negative epoch micros
+        SeaTunnelRowDebeziumDeserializationConverters converters =
+                new SeaTunnelRowDebeziumDeserializationConverters(
+                        new SeaTunnelRowType(
+                                new String[] {"millis", "micros", "nanos"},
+                                new SeaTunnelDataType[] {
+                                    LocalTimeType.LOCAL_DATE_TIME_TYPE,
+                                    LocalTimeType.LOCAL_DATE_TIME_TYPE,
+                                    LocalTimeType.LOCAL_DATE_TIME_TYPE
+                                }),
+                        new MetadataConverter[] {},
+                        ZoneId.systemDefault(),
+                        DebeziumDeserializationConverterFactory.DEFAULT);
+        Schema schema =
+                SchemaBuilder.struct()
+                        .field("millis", Timestamp.builder().optional().build())
+                        .field("micros", MicroTimestamp.builder().optional().build())
+                        .field("nanos", NanoTimestamp.builder().optional().build())
+                        .build();
+        LocalDateTime[] values = {
+            LocalDateTime.of(2026, 4, 27, 20, 50, 29, 6_733_123),
+            LocalDateTime.of(1970, 1, 1, 0, 0),
+            LocalDateTime.of(1969, 12, 31, 23, 59, 59, 999_999_999),
+            LocalDateTime.of(1969, 12, 31, 12, 0, 0, 500_000_000),
+            LocalDateTime.of(1900, 6, 15, 12, 30, 45, 123_456_789),
+            LocalDateTime.of(1000, 1, 1, 0, 0)
+        };
+        for (LocalDateTime value : values) {
+            Instant instant = value.toInstant(ZoneOffset.UTC);
+            // Debezium floors to the unit, so encode the same way (ChronoUnit.between truncates)
+            long seconds = instant.getEpochSecond();
+            int nano = instant.getNano();
+            // epoch nanos in a long only cover the years 1677 to 2262
+            boolean nanosFit = value.getYear() > 1677 && value.getYear() < 2262;
+            Struct struct = new Struct(schema);
+            struct.put("millis", seconds * 1000L + nano / 1_000_000);
+            struct.put("micros", seconds * 1_000_000L + nano / 1_000);
+            struct.put("nanos", nanosFit ? seconds * 1_000_000_000L + nano : null);
+            SourceRecord record =
+                    new SourceRecord(
+                            new HashMap<>(),
+                            new HashMap<>(),
+                            "topicName",
+                            null,
+                            SchemaBuilder.int32().build(),
+                            1,
+                            schema,
+                            struct,
+                            null,
+                            new ArrayList<>());
+
+            SeaTunnelRow row = converters.convert(record, struct, schema);
+            Assertions.assertEquals(
+                    value.truncatedTo(ChronoUnit.MILLIS), row.getField(0), "millis");
+            Assertions.assertEquals(
+                    value.truncatedTo(ChronoUnit.MICROS), row.getField(1), "micros");
+            Assertions.assertEquals(nanosFit ? value : null, row.getField(2), "nanos");
+        }
     }
 
     @Test
@@ -205,5 +276,58 @@ public class SeaTunnelRowDebeziumDeserializationConvertersTest {
         Object fieldValue = row.getField(0);
         Assertions.assertTrue(fieldValue instanceof String);
         Assertions.assertEquals("0102FF", fieldValue);
+    }
+
+    /**
+     * Verifies the fallback chain in {@code parseOffsetDateTimeFromString} against the four
+     * Debezium timestamp formats called out in the review:
+     *
+     * <ol>
+     *   <li>Standard ISO-8601 with numeric offset (baseline)
+     *   <li>Oracle TIMESTAMP WITH LOCAL TIME ZONE — IANA zone-region id
+     *   <li>MySQL TIMESTAMP in certain schema-history modes — space date/time separator
+     *   <li>PostgreSQL timestamptz — short-form hour-only offset
+     * </ol>
+     *
+     * All four variants must parse to the same UTC instant.
+     */
+    @Test
+    void testParseOffsetDateTimeFromStringFallbackChain() {
+        ZoneId serverTz = ZoneId.of("Asia/Shanghai");
+        // Expected UTC instant: 2024-01-01 04:00:00Z  (2024-01-01 12:00:00+08:00)
+        OffsetDateTime expected = Instant.parse("2024-01-01T04:00:00Z").atOffset(ZoneOffset.UTC);
+
+        // 1. ISO-8601 with numeric offset — handled by OffsetDateTime.parse
+        OffsetDateTime r1 =
+                SeaTunnelRowDebeziumDeserializationConverters.parseOffsetDateTimeFromString(
+                        "2024-01-01T12:00:00+08:00", serverTz);
+        Assertions.assertEquals(expected, r1, "ISO-8601 numeric offset failed");
+
+        // 2. IANA zone-region id — Oracle TIMESTAMP WITH LOCAL TIME ZONE
+        OffsetDateTime r2 =
+                SeaTunnelRowDebeziumDeserializationConverters.parseOffsetDateTimeFromString(
+                        "2024-01-01T12:00:00 Asia/Shanghai", serverTz);
+        Assertions.assertEquals(expected, r2, "IANA zone-region id failed");
+
+        // 3. Space separator — MySQL in certain schema-history modes
+        OffsetDateTime r3 =
+                SeaTunnelRowDebeziumDeserializationConverters.parseOffsetDateTimeFromString(
+                        "2024-01-01 12:00:00+08:00", serverTz);
+        Assertions.assertEquals(expected, r3, "Space date/time separator failed");
+
+        // 4. Short-form hour-only offset — PostgreSQL timestamptz
+        OffsetDateTime r4 =
+                SeaTunnelRowDebeziumDeserializationConverters.parseOffsetDateTimeFromString(
+                        "2024-01-01T12:00:00+08", serverTz);
+        Assertions.assertEquals(expected, r4, "Short-form hour-only offset failed");
+    }
+
+    @Test
+    void testParseOffsetDateTimeFromStringThrowsOnUnknownFormat() {
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        SeaTunnelRowDebeziumDeserializationConverters.parseOffsetDateTimeFromString(
+                                "not-a-timestamp", ZoneId.systemDefault()));
     }
 }

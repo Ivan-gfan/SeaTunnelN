@@ -1,10 +1,14 @@
+---
+sidebar_position: 15
+---
+
 # Slot Allocation Strategy
 
 Slot allocation strategy is an important part of SeaTunnel Engine, which determines how SeaTunnel Engine allocates tasks to different slots. The slot allocation strategy is a configurable component, and users can configure the slot allocation strategy according to their needs.
 
 **Configuration method:**
 
-Set the parameter `slot-allocation-strategy`, optional values are `RANDOM`, `SYSTEM_LOAD`, `SLOT_RATIO`.
+Set the parameter `slot-allocate-strategy`, optional values are `RANDOM`, `SYSTEM_LOAD`, `SLOT_RATIO`.
 
 Example:
 
@@ -12,7 +16,7 @@ Example:
 seatunnel:
   engine:
     slot-service:
-      slot-allocation-strategy: RANDOM
+      slot-allocate-strategy: RANDOM
 ```
 
 ## RANDOM (default value)

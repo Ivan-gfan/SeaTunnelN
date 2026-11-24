@@ -10,6 +10,25 @@ SeaTunnel Engine 的Master服务和Worker服务分离，每个服务单独一个
 
 这是最推荐的一种使用方式，在该模式下Master的负载会很小，Master有更多的资源用来进行作业的调度，任务的容错指标监控以及提供rest api服务等，会有更高的稳定性。同时Worker节点不存储Imap的数据，所有的Imap数据都存储在Master节点中，即使Worker节点负载高或者挂掉，也不会导致Imap数据重新分布。
 
+
+## 最小化部署配置
+
+以下列出分离集群各角色节点的最少数量与 HA 推荐数量，供初次部署规划参考。详细配置参数说明见后续各节。
+
+**节点要求**
+
+| 角色 | 最少数量 | 推荐（HA） | 说明 |
+|------|----------|------------|------|
+| Master | 1 | 2 | 负责调度与 IMap 数据存储 |
+| Worker | 1 | 2+ | 负责任务执行 |
+
+:::tip
+
+单个 Master 节点可以正常启动和运行，但不具备高可用能力。若需 HA，Master 至少部署 2 个：默认 `backup-count: 1` 要求至少 2 个 Master 节点才能存放 IMap 备份副本，否则单个 Master 宕机后集群将无法自愈。
+
+:::
+
+
 ## 1. 下载
 
 [下载和制作SeaTunnel安装包](download-seatunnel.md)
@@ -29,8 +48,8 @@ Master节点的JVM参数在`$SEATUNNEL_HOME/config/jvm_master_options`文件中�
 
 ```shell
 # JVM Heap
--Xms2g
--Xmx2g
+-Xms16g
+-Xmx16g
 
 # JVM Dump
 -XX:+HeapDumpOnOutOfMemoryError
@@ -48,8 +67,8 @@ Worker节点的JVM参数在`$SEATUNNEL_HOME/config/jvm_worker_options`文件中�
 
 ```shell
 # JVM Heap
--Xms2g
--Xmx2g
+-Xms16g
+-Xmx16g
 
 # JVM Dump
 -XX:+HeapDumpOnOutOfMemoryError
@@ -63,6 +82,8 @@ Worker节点的JVM参数在`$SEATUNNEL_HOME/config/jvm_worker_options`文件中�
 
 ```
 
+以上示例使用 16 GB JVM 堆内存。对于大规模数据处理场景，建议使用 32 GB JVM 堆内存。
+
 ## 4. 配置 SeaTunnel Engine
 
 SeaTunnel Engine 提供许多功能，需要在 `seatunnel.yaml` 中进行配置。.
@@ -75,7 +96,7 @@ SeaTunnel Engine 基于 [Hazelcast IMDG](https://docs.hazelcast.com/imdg/4.1/) �
 
 `backup count` 是定义同步备份数量的参数。例如，如果设置为 1，则分区的备份将放置在一个其他成员上。如果设置为 2，则将放置在两个其他成员上。
 
-我们建议 `backup-count` 的值为 `max(1, min(5, N/2))`。 `N` 是集群节点的数量。
+我们建议 `backup-count` 的值为 `max(1, min(5, N/2))`。`N` 是 Master 节点的数量。
 
 ```yaml
 seatunnel:
@@ -178,6 +199,22 @@ seatunnel:
     history-job-expire-minutes: 1440
 ```
 
+SeaTunnel 还会在分布式 Map 中短暂保留终态作业状态，然后再统一删除。这个保留窗口由 `state-cleanup-delay-ms` 控制，默认值是 `60000` 毫秒。短暂保留终态 tombstone 可以让晚到的异步回调读到终态，而不是直接遇到缺失的状态项。将它设置为 `0` 会恢复更激进的清理策略，但也会缩小终态竞态的保护窗口。
+
+```yaml
+seatunnel:
+  engine:
+    state-cleanup-delay-ms: 60000
+```
+
+`/system-monitoring-information` REST API 会向每个集群成员收集健康指标。所有成员共享一个由 `health-metrics-timeout-seconds` 控制的统一截止时间，默认值为 `3` 秒。在截止时间内未应答的成员会以带地址和 `timeout` 标记的条目返回，而不是一直阻塞整个响应，因此该 API 的总耗时不会随失联成员数量而增长。
+
+```yaml
+seatunnel:
+  engine:
+    health-metrics-timeout-seconds: 3
+```
+
 ### 4.5 类加载器缓存模式
 
 此配置主要解决不断创建和尝试销毁类加载器所导致的资源泄漏问题。
@@ -258,6 +295,12 @@ map:
         fs.defaultFS: file:///
 ```
 
+说明：`engine_runningJobMetrics` 保存的是高频运行时指标快照，`engine_checkpoint_monitor`
+保存的是 REST API 使用的 checkpoint overview/history。即使通过 `map.engine*` 配置了
+`map-store`，它们也会被有意排除在持久化 IMAP 存储之外，以避免仅用于可观测性的状态导致 WAL
+持续膨胀。Engine 重启后，running-job metrics 由后续 report 重新构建，checkpoint
+overview/history 从下一次 checkpoint 开始重新记录，而不会延续重启前的状态。
+
 如果您使用 OSS，可以像这样配置：
 
 ```yaml
@@ -279,15 +322,55 @@ map:
         fs.oss.endpoint: OSS endpoint
 ```
 
-注意：使用OSS 时，确保 lib目录下有这几个jar.
+如果要通过环境变量提供 OSS 凭据，请删除 `fs.oss.accessKeyId` 和
+`fs.oss.accessKeySecret`，并增加：
+
+```yaml
+        fs.oss.credentials.provider: com.aliyun.oss.common.auth.EnvironmentVariableCredentialsProvider
+```
+
+该 Provider 读取 `OSS_ACCESS_KEY_ID` 和 `OSS_ACCESS_KEY_SECRET`，临时凭据还可使用
+`OSS_SESSION_TOKEN`。
+
+注意：使用OSS 时，确保 lib目录下有这几个jar。
+
+其中 `seatunnel-shade-hadoop3-uber` 来自 [Apache SeaTunnel Shade](https://github.com/apache/seatunnel-shade) 项目，它是对 Hadoop 客户端的 shaded（包重定位）版本，所有第三方类被重定位到 `org.apache.seatunnel.shade.*` 下，避免与 SeaTunnel 自身的依赖产生类路径冲突。请使用 SeaTunnel 发行包 `lib/` 目录自带的 Hadoop Uber JAR。
 
 ```
-aliyun-sdk-oss-3.13.2.jar
-hadoop-aliyun-3.3.6.jar
-jdom2-2.0.6.jar
-netty-buffer-4.1.89.Final.jar 
+aliyun-sdk-oss-3.4.1.jar
+hadoop-aliyun-3.1.4.jar
+jdom-1.1.jar
+netty-buffer-4.1.89.Final.jar
 netty-common-4.1.89.Final.jar
-seatunnel-hadoop3-3.1.4-uber.jar
+seatunnel-shade-hadoop3-uber-*.jar
+```
+
+如果您使用 GCS，可以像这样配置：
+
+```yaml
+map:
+  engine*:
+    map-store:
+      enabled: true
+      initial-mode: EAGER
+      factory-class-name: org.apache.seatunnel.engine.server.persistence.FileMapStoreFactory
+      properties:
+        type: hdfs
+        namespace: /seatunnel/imap
+        clusterName: seatunnel-cluster
+        storage.type: gcs
+        gcs.bucket: gs://your-bucket
+        # 可选，未配置时使用 Application Default Credentials（例如 GKE Workload Identity）
+        fs.gs.auth.service.account.json.keyfile: /path/to/service-account-key.json
+```
+
+注意：IMap 的 WAL 写入器每次更新都会重写当前对象（与 S3、OSS 相同），而 GCS 对同一对象名的写入频率限制约为每秒一次，因此 GCS 作为 IMap 持久化存储更适合 IMap 更新频率较低或中等的场景。
+
+注意：使用 GCS 时，确保 lib 目录下有这几个jar。
+
+```
+gcs-connector-hadoop3-2.2.33-shaded.jar
+seatunnel-shade-hadoop3-uber-*.jar
 ```
 
 ### 4.7 作业调度策略
@@ -305,7 +388,7 @@ seatunnel:
     job-schedule-strategy: WAIT
 ```
 
-当`dynamic-slot: ture`时，`job-schedule-strategy: WAIT` 配置会失效，将被强制修改为`job-schedule-strategy: REJECT`，因为动态Slot时该参数没有意义，可以直接提交。
+当`dynamic-slot: true`时，`job-schedule-strategy: WAIT` 配置会失效，将被强制修改为`job-schedule-strategy: REJECT`，因为动态Slot时该参数没有意义，可以直接提交。
 
 ### 4.8 Coordinator Service
 
@@ -317,14 +400,16 @@ CoordinatorService 提供了每个作业从 LogicalDag 到 ExecutionDag，再到
 
 **max-thread-num**
 
-同时可执行的最大作业数量
+CoordinatorService 线程池的最大线程数（即线程池的 `maximumPoolSize`），默认值为 `Integer.MAX_VALUE`。
 
 Example
 
 ```yaml
-coordinator-service:
-  core-thread-num: 30
-  max-thread-num: 1000
+seatunnel:
+  engine:
+    coordinator-service:
+      core-thread-num: 30
+      max-thread-num: 1000
 ```
 
 ### 4.9 作业指标分区数量（此参数在 Worker 节点上无效）
@@ -462,6 +547,8 @@ mkdir -p $SEATUNNEL_HOME/logs
 
 日志将写入 `$SEATUNNEL_HOME/logs/seatunnel-engine-worker.log`
 
+> 如果 Worker 先于任何 Master 启动，它会在 `hazelcast.max.join.seconds`（默认 300 秒）内持续重试配置的 master 地址，并在等待期间输出 `This lite member cannot assume the master role ...` 日志。
+
 ## 8. 安装 SeaTunnel Engine 客户端
 
 ### 8.1 和服务端一样设置`SEATUNNEL_HOME`
@@ -473,9 +560,9 @@ export SEATUNNEL_HOME=${seatunnel install path}
 export PATH=$PATH:$SEATUNNEL_HOME/bin
 ```
 
-## 8. 提交作业和管理作业
+## 9. 提交作业和管理作业
 
-### 8.1 使用 SeaTunnel Engine 客户端提交作业
+### 9.1 使用 SeaTunnel Engine 客户端提交作业
 
 #### 安装 SeaTunnel Engine 客户端
 
@@ -515,6 +602,6 @@ hazelcast-client:
 
 现在集群部署完成了，您可以通过以下教程完成作业的提交和管理：[提交和管理作业](user-command.md)
 
-### 8.2 使用 REST API 提交作业
+### 9.2 使用 REST API 提交作业
 
 SeaTunnel Engine 提供了 REST API 用于提交作业。有关详细信息，请参阅 [REST API V2](rest-api-v2.md)

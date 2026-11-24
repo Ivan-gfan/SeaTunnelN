@@ -21,15 +21,20 @@ import org.apache.seatunnel.shade.org.apache.commons.lang3.StringUtils;
 
 import org.apache.seatunnel.api.table.catalog.Column;
 import org.apache.seatunnel.api.table.catalog.TableSchema;
+import org.apache.seatunnel.api.table.schema.event.AlterColumnCommentEvent;
 import org.apache.seatunnel.api.table.schema.event.AlterTableAddColumnEvent;
 import org.apache.seatunnel.api.table.schema.event.AlterTableChangeColumnEvent;
 import org.apache.seatunnel.api.table.schema.event.AlterTableColumnEvent;
 import org.apache.seatunnel.api.table.schema.event.AlterTableColumnsEvent;
+import org.apache.seatunnel.api.table.schema.event.AlterTableCommentEvent;
 import org.apache.seatunnel.api.table.schema.event.AlterTableDropColumnEvent;
 import org.apache.seatunnel.api.table.schema.event.AlterTableEvent;
 import org.apache.seatunnel.api.table.schema.event.AlterTableModifyColumnEvent;
 import org.apache.seatunnel.api.table.schema.event.AlterTableNameEvent;
+import org.apache.seatunnel.api.table.schema.event.RestoreTableSchemaEvent;
 import org.apache.seatunnel.api.table.schema.event.SchemaChangeEvent;
+import org.apache.seatunnel.api.table.schema.exception.SchemaEvolutionErrorCode;
+import org.apache.seatunnel.api.table.schema.exception.SchemaEvolutionException;
 import org.apache.seatunnel.api.table.type.SeaTunnelDataType;
 
 import java.util.Arrays;
@@ -58,6 +63,9 @@ public class AlterTableSchemaEventHandler implements TableSchemaChangeEventHandl
     }
 
     private TableSchema apply(TableSchema schema, AlterTableEvent alterTableEvent) {
+        if (alterTableEvent instanceof RestoreTableSchemaEvent) {
+            return ((RestoreTableSchemaEvent) alterTableEvent).getRestoredTable().getTableSchema();
+        }
         if (alterTableEvent instanceof AlterTableNameEvent) {
             return schema;
         }
@@ -80,6 +88,13 @@ public class AlterTableSchemaEventHandler implements TableSchemaChangeEventHandl
                 newSchema = apply(newSchema, columnEvent);
             }
             return newSchema;
+        }
+        if (alterTableEvent instanceof AlterTableCommentEvent) {
+            // Table comment changes do not affect the physical schema structure
+            return schema;
+        }
+        if (alterTableEvent instanceof AlterColumnCommentEvent) {
+            return applyColumnComment(schema, (AlterColumnCommentEvent) alterTableEvent);
         }
 
         throw new UnsupportedOperationException(
@@ -105,6 +120,20 @@ public class AlterTableSchemaEventHandler implements TableSchemaChangeEventHandl
             newColumns.addFirst(column);
         } else if (addColumnEvent.getAfterColumn() != null) {
             int index = originFields.indexOf(addColumnEvent.getAfterColumn());
+            if (index < 0) {
+                // -1 + 1 == 0 would silently insert the column first, misaligning every positional
+                // mapping downstream. The event names a column this schema does not have, so it
+                // does not describe this table.
+                throw new SchemaEvolutionException(
+                        SchemaEvolutionErrorCode.SCHEMA_EVENT_PROCESSING_FAILED,
+                        String.format(
+                                "Cannot add column '%s' after '%s': table %s has no such column,"
+                                        + " existing columns: %s",
+                                column.getName(),
+                                addColumnEvent.getAfterColumn(),
+                                addColumnEvent.tableIdentifier(),
+                                originFields));
+            }
             newColumns.add(index + 1, column);
         } else {
             newColumns.addLast(column);
@@ -201,6 +230,24 @@ public class AlterTableSchemaEventHandler implements TableSchemaChangeEventHandl
         }
         return TableSchema.builder()
                 .columns(originColumns)
+                .primaryKey(schema.getPrimaryKey())
+                .constraintKey(schema.getConstraintKeys())
+                .build();
+    }
+
+    private TableSchema applyColumnComment(
+            TableSchema schema, AlterColumnCommentEvent columnCommentEvent) {
+        List<String> fieldNames = Arrays.asList(schema.getFieldNames());
+        if (!fieldNames.contains(columnCommentEvent.getColumn())) {
+            return schema;
+        }
+        int columnIndex = fieldNames.indexOf(columnCommentEvent.getColumn());
+        LinkedList<Column> columns = new LinkedList<>(schema.getColumns());
+        columns.set(
+                columnIndex,
+                columns.get(columnIndex).copyWithComment(columnCommentEvent.getNewComment()));
+        return TableSchema.builder()
+                .columns(columns)
                 .primaryKey(schema.getPrimaryKey())
                 .constraintKey(schema.getConstraintKeys())
                 .build();

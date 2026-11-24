@@ -28,10 +28,16 @@ import org.apache.seatunnel.engine.common.Constant;
 import org.apache.seatunnel.engine.common.job.JobStatus;
 import org.apache.seatunnel.engine.common.job.JobStatusData;
 import org.apache.seatunnel.engine.common.utils.PassiveCompletableFuture;
+import org.apache.seatunnel.engine.core.checkpoint.CheckpointHistoryEntry;
+import org.apache.seatunnel.engine.core.checkpoint.CheckpointOverview;
+import org.apache.seatunnel.engine.core.checkpoint.CheckpointStatus;
 import org.apache.seatunnel.engine.core.job.JobDAGInfo;
 import org.apache.seatunnel.engine.core.job.JobImmutableInformation;
 import org.apache.seatunnel.engine.core.job.JobPipelineCheckpointData;
+import org.apache.seatunnel.engine.core.job.RestoreMode;
 import org.apache.seatunnel.engine.core.protocol.codec.SeaTunnelCancelJobCodec;
+import org.apache.seatunnel.engine.core.protocol.codec.SeaTunnelGetCheckpointHistoryCodec;
+import org.apache.seatunnel.engine.core.protocol.codec.SeaTunnelGetCheckpointOverviewCodec;
 import org.apache.seatunnel.engine.core.protocol.codec.SeaTunnelGetJobCheckpointCodec;
 import org.apache.seatunnel.engine.core.protocol.codec.SeaTunnelGetJobDetailStatusCodec;
 import org.apache.seatunnel.engine.core.protocol.codec.SeaTunnelGetJobInfoCodec;
@@ -43,6 +49,7 @@ import org.apache.seatunnel.engine.core.protocol.codec.SeaTunnelSavePointJobCode
 
 import lombok.NonNull;
 
+import java.util.Collections;
 import java.util.List;
 
 public class JobClient {
@@ -135,9 +142,13 @@ public class JobClient {
     }
 
     public void cancelJob(Long jobId) {
+        this.cancelJob(jobId, false);
+    }
+
+    public void cancelJob(Long jobId, boolean force) {
         PassiveCompletableFuture<Void> cancelFuture =
                 hazelcastClient.requestOnMasterAndGetCompletableFuture(
-                        SeaTunnelCancelJobCodec.encodeRequest(jobId));
+                        SeaTunnelCancelJobCodec.encodeRequest(jobId, force));
 
         cancelFuture.join();
     }
@@ -198,11 +209,41 @@ public class JobClient {
     }
 
     public List<JobPipelineCheckpointData> getCheckpointData(Long jobId) {
+        return getCheckpointData(jobId, RestoreMode.SAVEPOINT);
+    }
+
+    public List<JobPipelineCheckpointData> getCheckpointData(Long jobId, RestoreMode restoreMode) {
         return hazelcastClient
                 .getSerializationService()
                 .toObject(
                         hazelcastClient.requestOnMasterAndDecodeResponse(
-                                SeaTunnelGetJobCheckpointCodec.encodeRequest(jobId),
+                                SeaTunnelGetJobCheckpointCodec.encodeRequest(
+                                        jobId, restoreMode.getCode()),
                                 SeaTunnelGetJobCheckpointCodec::decodeResponse));
+    }
+
+    public CheckpointOverview getCheckpointOverview(Long jobId) {
+        return hazelcastClient
+                .getSerializationService()
+                .toObject(
+                        hazelcastClient.requestOnMasterAndDecodeResponse(
+                                SeaTunnelGetCheckpointOverviewCodec.encodeRequest(jobId),
+                                SeaTunnelGetCheckpointOverviewCodec::decodeResponse));
+    }
+
+    public List<CheckpointHistoryEntry> getCheckpointHistory(
+            Long jobId, Integer pipelineId, int limit, CheckpointStatus status) {
+        List<CheckpointHistoryEntry> history =
+                hazelcastClient
+                        .getSerializationService()
+                        .toObject(
+                                hazelcastClient.requestOnMasterAndDecodeResponse(
+                                        SeaTunnelGetCheckpointHistoryCodec.encodeRequest(
+                                                jobId,
+                                                pipelineId,
+                                                limit,
+                                                status == null ? -1 : status.ordinal()),
+                                        SeaTunnelGetCheckpointHistoryCodec::decodeResponse));
+        return history == null ? Collections.emptyList() : history;
     }
 }

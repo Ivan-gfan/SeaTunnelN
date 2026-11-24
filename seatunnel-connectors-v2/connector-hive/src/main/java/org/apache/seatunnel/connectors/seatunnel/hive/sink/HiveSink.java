@@ -34,6 +34,7 @@ import org.apache.seatunnel.api.sink.SupportSaveMode;
 import org.apache.seatunnel.api.table.catalog.CatalogTable;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.common.exception.CommonErrorCodeDeprecated;
+import org.apache.seatunnel.connectors.seatunnel.file.config.CompressFormat;
 import org.apache.seatunnel.connectors.seatunnel.file.config.FileFormat;
 import org.apache.seatunnel.connectors.seatunnel.file.config.HadoopConf;
 import org.apache.seatunnel.connectors.seatunnel.file.sink.commit.FileAggregatedCommitInfo;
@@ -43,9 +44,8 @@ import org.apache.seatunnel.connectors.seatunnel.file.sink.state.FileSinkState;
 import org.apache.seatunnel.connectors.seatunnel.file.sink.writer.WriteStrategy;
 import org.apache.seatunnel.connectors.seatunnel.file.sink.writer.WriteStrategyFactory;
 import org.apache.seatunnel.connectors.seatunnel.hive.commit.HiveSinkAggregatedCommitter;
-import org.apache.seatunnel.connectors.seatunnel.hive.config.HiveConfig;
 import org.apache.seatunnel.connectors.seatunnel.hive.config.HiveConstants;
-import org.apache.seatunnel.connectors.seatunnel.hive.config.HiveOptions;
+import org.apache.seatunnel.connectors.seatunnel.hive.config.HiveSinkOptions;
 import org.apache.seatunnel.connectors.seatunnel.hive.exception.HiveConnectorException;
 import org.apache.seatunnel.connectors.seatunnel.hive.sink.writter.HiveSinkWriter;
 import org.apache.seatunnel.connectors.seatunnel.hive.storage.StorageFactory;
@@ -53,15 +53,18 @@ import org.apache.seatunnel.connectors.seatunnel.hive.utils.HiveTableUtils;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.orc.CompressionKind;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import static org.apache.seatunnel.connectors.seatunnel.file.config.FileBaseSinkOptions.COMPRESS_CODEC;
 import static org.apache.seatunnel.connectors.seatunnel.file.config.FileBaseSinkOptions.FIELD_DELIMITER;
 import static org.apache.seatunnel.connectors.seatunnel.file.config.FileBaseSinkOptions.FILE_FORMAT_TYPE;
 import static org.apache.seatunnel.connectors.seatunnel.file.config.FileBaseSinkOptions.FILE_NAME_EXPRESSION;
@@ -151,7 +154,8 @@ public class HiveSink
                                     ConfigValueFactory.fromAnyRef(
                                             getDefaultTableLocation(readonlyConfig)));
 
-            return new FileSinkConfig(pluginConfig, catalogTable.getSeaTunnelRowType());
+            return new FileSinkConfig(
+                    ReadonlyConfig.fromConfig(pluginConfig), catalogTable.getSeaTunnelRowType());
         }
 
         List<String> sinkFields =
@@ -165,6 +169,7 @@ public class HiveSink
         sinkFields.addAll(partitionKeys);
 
         FileFormat fileFormat = HiveTableUtils.parseFileFormat(tableInformation);
+        pluginConfig = inheritTableCompression(pluginConfig, fileFormat, tableInformation);
         switch (fileFormat) {
             case TEXT:
                 Map<String, String> parameters =
@@ -220,7 +225,49 @@ public class HiveSink
                             ConfigValueFactory.fromAnyRef("${transactionId}"));
         }
 
-        return new FileSinkConfig(pluginConfig, catalogTable.getSeaTunnelRowType());
+        return new FileSinkConfig(
+                ReadonlyConfig.fromConfig(pluginConfig), catalogTable.getSeaTunnelRowType());
+    }
+
+    /**
+     * Inherits compression only while preparing an existing ORC table. Explicit codecs, including
+     * NONE, take precedence. Rejects enum values mapped to ORC NONE to prevent silent compression
+     * loss. Returns the original config or an immutable replacement without changing table
+     * metadata.
+     */
+    private Config inheritTableCompression(
+            Config pluginConfig, FileFormat fileFormat, Table table) {
+        if (!readonlyConfig.get(HiveSinkOptions.USE_TABLE_COMPRESSION)
+                || fileFormat != FileFormat.ORC
+                || pluginConfig.hasPath(COMPRESS_CODEC.key())) {
+            return pluginConfig;
+        }
+        Map<String, String> parameters = table.getParameters();
+        String codec = parameters == null ? null : parameters.get("orc.compress");
+        if (codec == null || codec.trim().isEmpty()) {
+            return pluginConfig;
+        }
+        CompressFormat compression;
+        try {
+            compression = CompressFormat.valueOf(codec.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            throw new HiveConnectorException(
+                    CommonErrorCodeDeprecated.ILLEGAL_ARGUMENT,
+                    String.format(
+                            "Unsupported orc.compress '%s' for Hive table %s.%s",
+                            codec, table.getDbName(), table.getTableName()),
+                    e);
+        }
+        if (compression != CompressFormat.NONE
+                && compression.getOrcCompression() == CompressionKind.NONE) {
+            throw new HiveConnectorException(
+                    CommonErrorCodeDeprecated.ILLEGAL_ARGUMENT,
+                    String.format(
+                            "Unsupported orc.compress '%s' for Hive table %s.%s",
+                            codec, table.getDbName(), table.getTableName()));
+        }
+        return pluginConfig.withValue(
+                COMPRESS_CODEC.key(), ConfigValueFactory.fromAnyRef(compression.name()));
     }
 
     @Override
@@ -238,7 +285,7 @@ public class HiveSink
             tableName = getTableInformation().getTableName();
         } else {
             // Derive from config to ensure non-null values during commit
-            String table = readonlyConfig.get(HiveConfig.TABLE_NAME);
+            String table = readonlyConfig.get(HiveSinkOptions.TABLE_NAME);
             org.apache.seatunnel.api.table.catalog.TablePath path =
                     org.apache.seatunnel.api.table.catalog.TablePath.of(table);
             dbName = path.getDatabaseName();
@@ -295,15 +342,17 @@ public class HiveSink
                 StorageFactory.getStorageType(hdfsLocation)
                         .buildHadoopConfWithReadOnlyConfig(readonlyConfig);
         readonlyConfig
-                .getOptional(HiveOptions.HDFS_SITE_PATH)
+                .getOptional(HiveSinkOptions.HDFS_SITE_PATH)
                 .ifPresent(hadoopConf::setHdfsSitePath);
-        readonlyConfig.getOptional(HiveOptions.REMOTE_USER).ifPresent(hadoopConf::setRemoteUser);
-        readonlyConfig.getOptional(HiveOptions.KRB5_PATH).ifPresent(hadoopConf::setKrb5Path);
         readonlyConfig
-                .getOptional(HiveOptions.KERBEROS_PRINCIPAL)
+                .getOptional(HiveSinkOptions.REMOTE_USER)
+                .ifPresent(hadoopConf::setRemoteUser);
+        readonlyConfig.getOptional(HiveSinkOptions.KRB5_PATH).ifPresent(hadoopConf::setKrb5Path);
+        readonlyConfig
+                .getOptional(HiveSinkOptions.KERBEROS_PRINCIPAL)
                 .ifPresent(hadoopConf::setKerberosPrincipal);
         readonlyConfig
-                .getOptional(HiveOptions.KERBEROS_KEYTAB_PATH)
+                .getOptional(HiveSinkOptions.KERBEROS_KEYTAB_PATH)
                 .ifPresent(hadoopConf::setKerberosKeytabPath);
         return hadoopConf;
     }
@@ -311,7 +360,7 @@ public class HiveSink
     // Try to read from configuration, qualify default location via HiveLocationUtils
     private String getDefaultTableLocation(ReadonlyConfig config) {
         try {
-            String table = config.get(HiveConfig.TABLE_NAME);
+            String table = config.get(HiveSinkOptions.TABLE_NAME);
             org.apache.seatunnel.api.table.catalog.TablePath path =
                     org.apache.seatunnel.api.table.catalog.TablePath.of(table);
             return org.apache.seatunnel.connectors.seatunnel.hive.utils.HiveLocationUtils

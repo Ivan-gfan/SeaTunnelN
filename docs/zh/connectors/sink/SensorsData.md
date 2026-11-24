@@ -4,49 +4,61 @@ import ChangeLog from '../changelog/connector-sensorsdata.md';
 
 > SensorsData Sink 连接器
 
-## 支持这些引擎
+## 支持的引擎
 
 > Spark<br/>
 > Flink<br/>
 > SeaTunnel Zeta<br/>
 
-## 关键特性
+## 主要特性
 
 - [ ] [精确一次](../../introduction/concepts/connector-v2-features.md)
-- [ ] [cdc](../../introduction/concepts/connector-v2-features.md)
+- [ ] [变更数据捕获](../../introduction/concepts/connector-v2-features.md)
 
 ## 描述
 
-一个 Sink 插件，使用 SensorsData SDK 发送数据记录。
+SensorsData Sink 使用 SensorsData SDK 把 SeaTunnel 行数据发送为 SensorsData 记录。它支持用户事件、
+用户明细记录和物品记录。调试时可以设置 `consumer = "console"`，把转换后的记录打印到控制台，而不是发送到
+SensorsData 服务端。
 
 ## Sink 选项
 
-| 参数名                      | 类型    | 必须 | 默认值 |
-|---------------------------|---------|------|--------|
-| server_url                | string  | 是   | -      |
-| bulk_size                 | int     | 否   | 50     |
-| max_cache_row_size        | int     | 否   | 0      |
-| consumer                  | string  | 否   | batch  |
-| entity_name               | string  | 是   | users  |
-| record_type               | string  | 是   | users  |
-| schema                    | string  | 是   | users  |
-| distinct_id_column        | string  | 是   | -      |
-| identity_fields           | array   | 是   | -      |
-| property_fields           | array   | 是   | -      |
-| event_name                | string  | 是   | -      |
-| time_column               | string  | 是   | -      |
-| time_free                 | boolean | 否   | false  |
-| detail_id_column          | string  | 否   | -      |
-| item_id_column            | string  | 否   | -      |
-| item_type_column          | string  | 否   | -      |
-| skip_error_record         | boolean | 否   | false  |
-| instant_events            | array   | 否   | -      |
-| distinct_id_by_identities | boolean | 否   | false  |
-| null_as_profile_unset     | boolean | 否   | false  |
-| common-options            |         | 否   | -      |
+| 参数名                      | 类型    | 是否必填 | 默认值 | 说明 |
+|---------------------------|---------|----------|--------|------|
+| server_url                | string  | 是       | -      | SensorsData 数据接收地址，例如 `https://host:8106/sa?project=default`。 |
+| bulk_size                 | int     | 否       | 50     | SensorsData SDK 缓存达到多少条后触发发送。 |
+| max_cache_row_size        | int     | 否       | 0      | 最大缓存条数，超过后立即发送；`0` 表示跟随 `bulk_size`。 |
+| consumer                  | string  | 否       | batch  | 消费方式。`batch` 表示发送到 SensorsData，`console` 表示打印到控制台。 |
+| entity_name               | string  | 是       | users  | 实体名称，支持 `users` 和 `items`。 |
+| record_type               | string  | 是       | users  | 记录类型，常用值为 `events`、`details`、`items`。 |
+| schema                    | string  | 条件必填 | users  | Schema 名称。用户记录（`entity_name = "users"`）需要配置。 |
+| distinct_id_column        | string  | 条件必填 | -      | 作为 SensorsData distinct ID 的输入字段。用户记录需要配置。 |
+| identity_fields           | array   | 条件必填 | -      | 身份字段映射。用户记录需要配置。 |
+| property_fields           | array   | 条件必填 | -      | 属性字段映射和目标类型。用户记录需要配置。 |
+| event_name                | string  | 条件必填 | -      | 事件名或 `${field_name}` 表达式。`record_type = "events"` 时必填。 |
+| time_column               | string  | 条件必填 | -      | 事件时间字段。`record_type = "events"` 时必填；可用 `current_time()` 表示处理时间。 |
+| detail_id_column          | string  | 条件必填 | -      | 明细 ID 字段。`record_type = "details"` 时必填。 |
+| item_id_column            | string  | 条件必填 | -      | 物品 ID 字段。`record_type = "items"` 时必填。 |
+| item_type_column          | string  | 条件必填 | -      | 物品类型字段。`record_type = "items"` 时必填。 |
+| time_free                 | boolean | 否       | false  | 是否启用 SensorsData 历史数据模式。 |
+| skip_error_record         | boolean | 否       | false  | 转换失败时是否跳过该条记录。 |
+| instant_events            | array   | 否       | []     | 标记为即时事件的事件名列表。 |
+| distinct_id_by_identities | boolean | 否       | false  | 当 `distinct_id_column` 为空时，是否从 `identity_fields` 中取 distinct ID。 |
+| null_as_profile_unset     | boolean | 否       | false  | 是否把用户属性中的 null 转成 profile unset 操作。 |
+| common-options            | config  | 否       | -      | Sink 通用选项，详见 [Sink 通用选项](../common-options/sink-common-options.md)。 |
 
 
 ## 参数解释
+
+### 记录类型要求
+
+- 用户事件：设置 `entity_name = "users"` 和 `record_type = "events"`，并配置 `event_name`、
+  `time_column`、`distinct_id_column`、`identity_fields`、`property_fields`。
+- 用户明细：设置 `entity_name = "users"` 和 `record_type = "details"`，并配置 `detail_id_column`、
+  `distinct_id_column`、`identity_fields`、`property_fields`。
+- 物品记录：设置 `entity_name = "items"` 和 `record_type = "items"`，并配置 `item_id_column`、
+  `item_type_column`、`property_fields`。
+
 ### server_url [string]
 
 SensorsData 数据 Sink 地址，格式为 `https://${host}:8106/sa?project=${project}`
@@ -154,7 +166,7 @@ SensorsData 实体数据模型的模式名称。
 
 ### 通用选项
 
-Sink 插件通用参数，请参考 [Sink 通用选项](common-options.md) 详见
+Sink 插件通用参数，详见 [Sink 通用选项](../common-options/sink-common-options.md)。
 
 ## 示例
 
@@ -222,7 +234,7 @@ sink {
     time_free = true
 
     entity_name = users
-    record_type = profile
+    record_type = users
     schema = users
     distinct_id_column = user_id
     identity_fields = [
@@ -242,31 +254,94 @@ sink {
 
 ### 项目跟踪
 
+物品记录必须设置 `entity_name = items`。`entity_name` 的默认值是 `users`，在该默认值下
+`record_type = items` 会在写入器启动时以 `UNSUPPORTED_RECORD_TYPE` 报错。物品记录只使用
+`item_id_column`、`item_type_column`、`property_fields` 以及可选的 `time_column`；`schema`、
+`event_name`、`distinct_id_column`、`identity_fields` 等仅用于用户记录的参数无需配置。
+
 ```hocon
 sink {
   SensorsData {
     server_url = "http://10.1.136.63:8106/sa?project=default"
     time_free = true
 
+    entity_name = items
     record_type = items
-    schema = items
-    event_name = "$ItemViewed"
+    item_id_column = product_id
+    item_type_column = product_type
     time_column = view_time
-    distinct_id_column = user_id
-    identity_fields = [
-      { source = user_id, target = "$identity_login_id" }
-    ]
     property_fields = [
       { target = "view_duration", source = duration, type = INT }
       { target = "referrer", source = referrer_url, type = STRING }
     ]
-    item_id_column = product_id
-    item_type_column = product_type
+  }
+}
+```
+
+### 用户明细（Detail 记录）
+
+用户明细记录（`record_type = "details"`）会为 SensorsData 用户附加一条按记录维度的标识。
+`detail_id_column` 提供明细键，`distinct_id_column` 和 `identity_fields` 用于标识所属用户。
+
+```hocon
+sink {
+  SensorsData {
+    consumer = console
+    server_url = "http://10.129.27.43:8106/sa?project=sditest"
+    time_free = true
+
+    record_type = details
+    schema = fund_manager
+    distinct_id_column = c_id
+    detail_id_column = c_id
+    identity_fields = [
+      { target = "$identity_distinct_id", source = c_id }
+    ]
+    property_fields = [
+      { target = c_id, source = c_id, type = STRING }
+      { target = fund_amount, source = c_int, type = INT }
+      { target = "$is_valid", source = c_boolean, type = BOOLEAN }
+    ]
+  }
+}
+```
+
+### 多身份与动态事件名称
+
+下面的示例直接从数据行本身构造事件名称（`event_name = "${c_event}"`），并一次性映射多个身份
+（`$identity_login_id`、`$identity_distinct_id`）。转换失败的记录会通过 `skip_error_record = true` 跳过。
+
+```hocon
+sink {
+  SensorsData {
+    consumer = console
+    server_url = "http://10.1.136.63:8106/sa?project=default"
+    time_free = true
+
+    record_type = events
+    schema = events
+    event_name = "${c_event}"
+    time_column = c_date
+    distinct_id_column = c_bigint
+    identity_fields = [
+      { source = c_bigint, target = "$identity_login_id" }
+      { source = c_bigint, target = "$identity_distinct_id" }
+    ]
+    property_fields = [
+      { target = c_tinyint, source = c_tinyint, type = INT }
+      { target = c_bigint,   source = c_bigint,   type = BIGINT }
+      { target = c_int,      source = c_int,      type = INT }
+      { target = c_boolean,  source = c_boolean,  type = BOOLEAN }
+    ]
+    skip_error_record = true
   }
 }
 ```
 
 ### 控制台输出（用于测试）
+
+这里 `entity_name` 保持默认值 `users`，因此和其他用户记录示例一样必须配置 `identity_fields`；
+缺少该参数时作业会在参数校验阶段失败。
 
 ```hocon
 sink {
@@ -278,6 +353,9 @@ sink {
     event_name = "$TestEvent"
     time_column = timestamp
     distinct_id_column = test_id
+    identity_fields = [
+      { source = test_id, target = "$identity_distinct_id" }
+    ]
     property_fields = [
       { target = "test", source = test_field, type = STRING }
     ]
@@ -288,5 +366,3 @@ sink {
 ## 变更日志
 
 <ChangeLog />
-
-

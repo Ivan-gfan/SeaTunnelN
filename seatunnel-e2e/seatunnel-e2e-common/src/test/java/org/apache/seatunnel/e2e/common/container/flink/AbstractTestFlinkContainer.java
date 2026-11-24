@@ -17,8 +17,6 @@
 
 package org.apache.seatunnel.e2e.common.container.flink;
 
-import org.apache.seatunnel.shade.com.google.common.collect.Lists;
-
 import org.apache.seatunnel.common.utils.FileUtils;
 import org.apache.seatunnel.e2e.common.container.AbstractTestContainer;
 import org.apache.seatunnel.e2e.common.container.ContainerExtendedFactory;
@@ -42,6 +40,12 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
 
 /**
@@ -59,12 +63,30 @@ public abstract class AbstractTestFlinkContainer extends AbstractTestContainer {
                     "taskmanager.numberOfTaskSlots: 10",
                     "parallelism.default: 4",
                     "env.java.opts: -Doracle.jdbc.timezoneAsRegion=false",
+                    // One TaskManager serves every job of a test class, and each SeaTunnel job
+                    // loads its connector jars through a fresh user-code ClassLoader. With the
+                    // Flink default of 256mb the metaspace is exhausted part-way through a long
+                    // class ("OutOfMemoryError: Metaspace"), which kills the TaskManager and fails
+                    // whichever job happens to be running. Raise the process budget alongside it so
+                    // the extra metaspace is not taken out of the derived heap/network/managed
+                    // pools.
+                    "taskmanager.memory.process.size: 2048m",
+                    "taskmanager.memory.jvm-metaspace.size: 512m",
+                    // CI runners host several containers at once, so a TaskManager can be starved
+                    // of CPU for longer than the 50s Flink default before it answers a heartbeat.
+                    // A missed heartbeat fails the job outright, because SeaTunnel jobs run with
+                    // NoRestartBackoffTimeStrategy unless the job config asks for restarts.
+                    "heartbeat.timeout: 120000",
+                    "heartbeat.interval: 10000",
                     // limit restart attempts in e2e to avoid infinite retries
                     "restart-strategy: fixed-delay",
                     "restart-strategy.fixed-delay.attempts: 2",
                     "restart-strategy.fixed-delay.delay: 1000");
 
-    protected static final String DEFAULT_DOCKER_IMAGE = "flink:1.13.6-scala_2.11";
+    // Pinned to the java11 flavour: SeaTunnel is built to Java 11 bytecode, so a Flink image on a
+    // Java 8 runtime cannot load its classes.
+    protected static final String DEFAULT_DOCKER_IMAGE = "flink:1.13.6-scala_2.11-java11";
+    private static final int FLINK_REST_PORT = 8081;
 
     protected GenericContainer<?> jobManager;
     protected GenericContainer<?> taskManager;
@@ -84,7 +106,7 @@ public abstract class AbstractTestFlinkContainer extends AbstractTestContainer {
                         .withCommand("jobmanager")
                         .withNetwork(NETWORK)
                         .withNetworkAliases("jobmanager")
-                        .withExposedPorts()
+                        .withExposedPorts(FLINK_REST_PORT)
                         .withEnv("FLINK_PROPERTIES", properties)
                         .withLogConsumer(
                                 new Slf4jLogConsumer(
@@ -97,9 +119,9 @@ public abstract class AbstractTestFlinkContainer extends AbstractTestContainer {
                                 HOST_VOLUME_MOUNT_PATH,
                                 CONTAINER_VOLUME_MOUNT_PATH,
                                 BindMode.READ_WRITE);
+        applyJavaToolOptions(jobManager);
         copySeaTunnelStarterToContainer(jobManager);
         copySeaTunnelStarterLoggingToContainer(jobManager);
-        jobManager.setPortBindings(Lists.newArrayList(String.format("%s:%s", 8081, 8081)));
 
         taskManager =
                 new GenericContainer<>(dockerImage)
@@ -121,6 +143,7 @@ public abstract class AbstractTestFlinkContainer extends AbstractTestContainer {
                                 HOST_VOLUME_MOUNT_PATH,
                                 CONTAINER_VOLUME_MOUNT_PATH,
                                 BindMode.READ_WRITE);
+        applyJavaToolOptions(taskManager);
 
         Startables.deepStart(Stream.of(jobManager)).join();
         Startables.deepStart(Stream.of(taskManager)).join();
@@ -131,19 +154,23 @@ public abstract class AbstractTestFlinkContainer extends AbstractTestContainer {
         return DEFAULT_FLINK_PROPERTIES;
     }
 
+    /**
+     * Returns test-scoped JVM options injected through the standard launcher hook for every Java
+     * process started in the Flink containers.
+     *
+     * @return JVM option string or {@code null} when no extra options are required
+     */
+    protected String getJavaToolOptions() {
+        return null;
+    }
+
     @Override
     public void tearDown() throws Exception {
-        if (taskManager != null) {
-            // delete the volume
-            taskManager.execInContainer("rm", "-rf", CONTAINER_VOLUME_MOUNT_PATH);
-            taskManager.stop();
-        }
-        if (jobManager != null) {
-            // delete the volume
-            jobManager.execInContainer("rm", "-rf", CONTAINER_VOLUME_MOUNT_PATH);
-            jobManager.stop();
-        }
-        FileUtils.deleteFile(HOST_VOLUME_MOUNT_PATH);
+        // Stop both containers even if one of them never started or the volume cleanup fails. A
+        // JobManager left running keeps the "jobmanager" alias on the shared network, and the
+        // TaskManager of the next test case can then register with it instead of its own
+        // JobManager, which leaves that case's job waiting for slots forever.
+        stopContainersAndDeleteVolume(taskManager, jobManager);
     }
 
     @Override
@@ -178,11 +205,143 @@ public abstract class AbstractTestFlinkContainer extends AbstractTestContainer {
         return executeJob(confFile, Collections.emptyList());
     }
 
+    /**
+     * Upper bound for one SeaTunnel job submitted through {@link #executeJob}. Every green Flink
+     * E2E job finishes within minutes, so a job still running after this long has hung. Letting it
+     * run until the workflow's timeout-minutes kills the whole job discards the only evidence that
+     * explains the hang, the JVM thread dumps, and burns the rest of the job budget.
+     */
+    private static final long JOB_TIMEOUT_MINUTES = 30;
+
+    /**
+     * Upper bound, enforced on the host, for one thread dump request. The request is itself a
+     * {@code docker exec}; if the Docker transport stalls instead of failing, an unbounded request
+     * would block the test past {@link #JOB_TIMEOUT_MINUTES} and recreate the silent workflow-level
+     * cancellation this class exists to prevent. The in-container command only needs a few seconds
+     * (signal the JVMs, then sleep 5 so HotSpot can write the dumps), so a request that misses this
+     * deadline is abandoned and logged. Stopping the containers in teardown remains the cleanup
+     * boundary for whatever the abandoned exec left behind.
+     */
+    private static final long THREAD_DUMP_TIMEOUT_SECONDS = 60;
+
+    /**
+     * Shell command that asks every JVM in a container for a thread dump. SIGQUIT makes HotSpot
+     * print the dump to the process's own stdout, which testcontainers already forwards into the
+     * test log, so this works on images without jstack or jcmd. The JVMs are found through /proc
+     * because the Flink images do not ship pgrep.
+     */
+    private static final String THREAD_DUMP_COMMAND =
+            "for proc in /proc/[0-9]*; do"
+                    + " if [ \"$(cat \"$proc/comm\" 2>/dev/null)\" = java ]; then"
+                    + " kill -QUIT \"${proc#/proc/}\"; fi; done; sleep 5";
+
     @Override
     public Container.ExecResult executeJob(String confFile, List<String> variables)
             throws IOException, InterruptedException {
         log.info("test in container: {}", identifier());
-        return executeJob(jobManager, confFile, null, variables);
+        ExecutorService executor = newDaemonExecutor("flink-e2e-job-" + identifier());
+        Future<Container.ExecResult> result =
+                executor.submit(() -> executeJob(jobManager, confFile, null, variables));
+        try {
+            return result.get(getJobTimeout().toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            // Capture the state of both JVMs before anything is torn down. Each request is bounded
+            // on the host (see THREAD_DUMP_TIMEOUT_SECONDS), so a stalled first request cannot
+            // prevent the second one or the timeout failure below.
+            dumpJvmThreads("jobmanager", jobManager);
+            dumpJvmThreads("taskmanager", taskManager);
+            result.cancel(true);
+            throw new IllegalStateException(
+                    "SeaTunnel job "
+                            + confFile
+                            + " did not finish within "
+                            + getJobTimeout().toMinutes()
+                            + " minutes on "
+                            + identifier()
+                            + "; thread dumps of the JobManager and TaskManager JVMs were"
+                            + " requested and are in their container logs above",
+                    e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            if (cause instanceof InterruptedException) {
+                throw (InterruptedException) cause;
+            }
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw new IllegalStateException(cause);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * How long {@link #executeJob} waits for the job before treating it as hung. Overridden by unit
+     * tests so the timeout path can be exercised without a real 30-minute job.
+     */
+    Duration getJobTimeout() {
+        return Duration.ofMinutes(JOB_TIMEOUT_MINUTES);
+    }
+
+    /**
+     * How long {@link #dumpJvmThreads} waits for one thread dump request on the host side.
+     * Overridden by unit tests so a stalled request can be simulated within a test budget.
+     */
+    Duration getThreadDumpTimeout() {
+        return Duration.ofSeconds(THREAD_DUMP_TIMEOUT_SECONDS);
+    }
+
+    /**
+     * Requests thread dumps from every JVM in the container and waits at most {@link
+     * #getThreadDumpTimeout()} for the request to return. Failures and timeouts are only logged:
+     * the dumps are diagnostics for the job timeout, and must never replace or delay it.
+     */
+    private void dumpJvmThreads(String role, GenericContainer<?> container) {
+        ExecutorService executor = newDaemonExecutor("flink-e2e-thread-dump-" + role);
+        Future<Container.ExecResult> dump =
+                executor.submit(() -> container.execInContainer("bash", "-c", THREAD_DUMP_COMMAND));
+        try {
+            Container.ExecResult result =
+                    dump.get(getThreadDumpTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            log.warn(
+                    "Requested thread dumps from the {} JVMs (exit code {}) {}{}",
+                    role,
+                    result.getExitCode(),
+                    result.getStdout(),
+                    result.getStderr());
+        } catch (TimeoutException e) {
+            log.warn(
+                    "Thread dump request to the {} JVMs did not return within {}; abandoning it so"
+                            + " the job timeout can still be reported",
+                    role,
+                    getThreadDumpTimeout());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Interrupted while requesting thread dumps from the {} JVMs", role, e);
+        } catch (Exception e) {
+            log.warn("Could not request thread dumps from the {} JVMs", role, e);
+        } finally {
+            // Also interrupts a request that missed the deadline, so the daemon thread does not
+            // keep a stalled docker exec alive for the rest of the JVM's life.
+            dump.cancel(true);
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * Daemon threads keep a stalled docker exec from pinning the JVM after the test has already
+     * failed; the surefire/failsafe fork must still be able to exit.
+     */
+    private static ExecutorService newDaemonExecutor(String threadName) {
+        return Executors.newSingleThreadExecutor(
+                runnable -> {
+                    Thread thread = new Thread(runnable, threadName);
+                    thread.setDaemon(true);
+                    return thread;
+                });
     }
 
     @Override
@@ -195,6 +354,27 @@ public abstract class AbstractTestFlinkContainer extends AbstractTestContainer {
         return jobManager.execInContainer("bash", "-c", command).getStdout();
     }
 
+    /**
+     * Executes a shell command inside the TaskManager container after the cluster has started.
+     *
+     * @param command shell command evaluated by bash
+     * @return standard output captured from the TaskManager container
+     * @throws IOException when docker exec fails
+     * @throws InterruptedException when the docker exec call is interrupted
+     */
+    public String executeTaskManagerInnerCommand(String command)
+            throws IOException, InterruptedException {
+        return taskManager.execInContainer("bash", "-c", command).getStdout();
+    }
+
+    public String getJobManagerHost() {
+        return jobManager.getHost();
+    }
+
+    public int getJobManagerRestPort() {
+        return jobManager.getMappedPort(FLINK_REST_PORT);
+    }
+
     @Override
     public void copyFileToContainer(String path, String targetPath) {
         ContainerUtil.copyFileIntoContainers(
@@ -204,5 +384,18 @@ public abstract class AbstractTestFlinkContainer extends AbstractTestContainer {
     @Override
     public void copyAbsolutePathToContainer(String path, String targetPath) {
         ContainerUtil.copyFileIntoContainers(Paths.get(path), targetPath, jobManager);
+    }
+
+    /**
+     * Uses the standard JVM launcher environment hook so both Flink daemons and helper Java
+     * processes observe the same system properties in E2E tests.
+     *
+     * @param container Flink runtime container being prepared before startup
+     */
+    protected void applyJavaToolOptions(GenericContainer<?> container) {
+        String javaToolOptions = getJavaToolOptions();
+        if (javaToolOptions != null && !javaToolOptions.trim().isEmpty()) {
+            container.withEnv("JAVA_TOOL_OPTIONS", javaToolOptions);
+        }
     }
 }

@@ -17,6 +17,7 @@
 
 package org.apache.seatunnel.connectors.seatunnel.maxcompute.sink;
 
+import org.apache.seatunnel.api.configuration.util.Conditions;
 import org.apache.seatunnel.api.configuration.util.OptionRule;
 import org.apache.seatunnel.api.options.SinkConnectorCommonOptions;
 import org.apache.seatunnel.api.options.table.FormatOptions;
@@ -37,17 +38,23 @@ public class MaxcomputeSinkFactory implements TableSinkFactory {
         return MaxcomputeSinkOptions.PLUGIN_NAME;
     }
 
+    /**
+     * Declares sink retry bounds before client creation while retaining runtime guards for source
+     * and catalog entry points.
+     */
     @Override
     public OptionRule optionRule() {
         return OptionRule.builder()
                 .required(
-                        MaxcomputeSinkOptions.ACCESS_ID,
-                        MaxcomputeSinkOptions.ACCESS_KEY,
                         MaxcomputeSinkOptions.ENDPOINT,
                         MaxcomputeSinkOptions.PROJECT,
                         MaxcomputeSinkOptions.TABLE_NAME)
                 .optional(
+                        MaxcomputeSinkOptions.ACCESS_ID,
+                        MaxcomputeSinkOptions.ACCESS_KEY,
+                        MaxcomputeSinkOptions.STS_TOKEN,
                         MaxcomputeSinkOptions.PARTITION_SPEC,
+                        MaxcomputeSinkOptions.SCHEMA_NAME,
                         MaxcomputeSinkOptions.OVERWRITE,
                         MaxcomputeSinkOptions.SCHEMA_SAVE_MODE,
                         MaxcomputeSinkOptions.DATA_SAVE_MODE,
@@ -55,7 +62,18 @@ public class MaxcomputeSinkFactory implements TableSinkFactory {
                         MaxcomputeSinkOptions.CUSTOM_SQL,
                         FormatOptions.DATETIME_FORMAT,
                         MaxcomputeSinkOptions.TUNNEL_ENDPOINT,
+                        MaxcomputeSinkOptions.TUNNEL_NAME,
+                        MaxcomputeSinkOptions.CONNECT_TIMEOUT_MS,
+                        MaxcomputeSinkOptions.READ_TIMEOUT_MS,
+                        MaxcomputeSinkOptions.TUNNEL_CONNECT_TIMEOUT_MS,
+                        MaxcomputeSinkOptions.TUNNEL_READ_TIMEOUT_MS,
                         SinkConnectorCommonOptions.MULTI_TABLE_SINK_REPLICA)
+                .optional(
+                        MaxcomputeSinkOptions.RETRY_TIMES,
+                        Conditions.greaterOrEqual(MaxcomputeSinkOptions.RETRY_TIMES, 0))
+                .optional(
+                        MaxcomputeSinkOptions.TUNNEL_RETRY_TIMES,
+                        Conditions.greaterOrEqual(MaxcomputeSinkOptions.TUNNEL_RETRY_TIMES, 0))
                 .build();
     }
 
@@ -68,6 +86,9 @@ public class MaxcomputeSinkFactory implements TableSinkFactory {
                                 TableIdentifier.of(
                                         context.getCatalogTable().getCatalogName(),
                                         context.getOptions().get(MaxcomputeSinkOptions.PROJECT),
+                                        context.getOptions()
+                                                .getOptional(MaxcomputeSinkOptions.SCHEMA_NAME)
+                                                .orElse(null),
                                         context.getOptions().get(MaxcomputeSinkOptions.TABLE_NAME)),
                                 context.getCatalogTable()));
     }

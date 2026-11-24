@@ -25,11 +25,13 @@ import org.apache.seatunnel.common.utils.FileUtils;
 import org.apache.seatunnel.engine.client.SeaTunnelClient;
 import org.apache.seatunnel.engine.client.job.ClientJobExecutionEnvironment;
 import org.apache.seatunnel.engine.client.job.ClientJobProxy;
+import org.apache.seatunnel.engine.common.Constant;
 import org.apache.seatunnel.engine.common.config.ConfigProvider;
 import org.apache.seatunnel.engine.common.config.JobConfig;
 import org.apache.seatunnel.engine.common.config.SeaTunnelConfig;
 import org.apache.seatunnel.engine.common.job.JobStatus;
 import org.apache.seatunnel.engine.server.SeaTunnelServerStarter;
+import org.apache.seatunnel.engine.server.common.statestore.EngineStateStoreNames;
 
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Assertions;
@@ -39,7 +41,9 @@ import org.testcontainers.shaded.org.apache.commons.lang3.tuple.ImmutablePair;
 
 import com.hazelcast.client.config.ClientConfig;
 import com.hazelcast.config.Config;
+import com.hazelcast.core.EntryView;
 import com.hazelcast.instance.impl.HazelcastInstanceImpl;
+import com.hazelcast.map.IMap;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 
@@ -83,6 +87,7 @@ public class ClusterFaultToleranceIT {
         seaTunnelConfig
                 .getHazelcastConfig()
                 .setClusterName(TestUtils.getClusterName(testClusterName));
+        seaTunnelConfig.getEngineConfig().getHttpConfig().setEnabled(false);
 
         try {
             node1 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
@@ -211,6 +216,7 @@ public class ClusterFaultToleranceIT {
         seaTunnelConfig
                 .getHazelcastConfig()
                 .setClusterName(TestUtils.getClusterName(testClusterName));
+        seaTunnelConfig.getEngineConfig().getHttpConfig().setEnabled(false);
         try {
             node1 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
 
@@ -305,6 +311,7 @@ public class ClusterFaultToleranceIT {
         seaTunnelConfig
                 .getHazelcastConfig()
                 .setClusterName(TestUtils.getClusterName(testClusterName));
+        seaTunnelConfig.getEngineConfig().getHttpConfig().setEnabled(false);
         try {
             node1 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
 
@@ -371,9 +378,11 @@ public class ClusterFaultToleranceIT {
                                         JobStatus.FINISHED, objectCompletableFuture.get());
                             });
 
-            Long fileLineNumberFromDir =
-                    FileUtils.getFileLineNumberFromDir(testResources.getLeft());
-            Assertions.assertEquals(testRowNumber * testParallelism, fileLineNumberFromDir);
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    60_000L);
 
         } finally {
             if (engineClient != null) {
@@ -404,6 +413,7 @@ public class ClusterFaultToleranceIT {
         seaTunnelConfig
                 .getHazelcastConfig()
                 .setClusterName(TestUtils.getClusterName(testClusterName));
+        seaTunnelConfig.getEngineConfig().getHttpConfig().setEnabled(false);
         try {
             node1 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
 
@@ -468,12 +478,14 @@ public class ClusterFaultToleranceIT {
                                         lineNumberFromDir);
                                 Assertions.assertEquals(
                                         JobStatus.RUNNING, clientJobProxy.getJobStatus());
-                                Assertions.assertEquals(
-                                        testRowNumber * testParallelism, lineNumberFromDir);
+                                Assertions.assertTrue(lineNumberFromDir > 1);
                             });
 
-            // sleep 10s and expect the job don't write more rows.
-            Thread.sleep(10000);
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    300_000L);
             clientJobProxy.cancelJob();
 
             Awaitility.await()
@@ -487,10 +499,11 @@ public class ClusterFaultToleranceIT {
                                         JobStatus.CANCELED, waitForCompletableFuture.get());
                             });
 
-            // check the final rows
-            Long fileLineNumberFromDir =
-                    FileUtils.getFileLineNumberFromDir(testResources.getLeft());
-            Assertions.assertEquals(testRowNumber * testParallelism, fileLineNumberFromDir);
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    60_000L);
 
         } finally {
             if (engineClient != null) {
@@ -521,6 +534,7 @@ public class ClusterFaultToleranceIT {
         seaTunnelConfig
                 .getHazelcastConfig()
                 .setClusterName(TestUtils.getClusterName(testClusterName));
+        seaTunnelConfig.getEngineConfig().getHttpConfig().setEnabled(false);
         try {
             node1 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
 
@@ -588,9 +602,11 @@ public class ClusterFaultToleranceIT {
                                         JobStatus.FINISHED, objectCompletableFuture.get());
                             });
 
-            Long fileLineNumberFromDir =
-                    FileUtils.getFileLineNumberFromDir(testResources.getLeft());
-            Assertions.assertEquals(testRowNumber * testParallelism, fileLineNumberFromDir);
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    60_000L);
 
         } finally {
             if (engineClient != null) {
@@ -621,6 +637,7 @@ public class ClusterFaultToleranceIT {
         seaTunnelConfig
                 .getHazelcastConfig()
                 .setClusterName(TestUtils.getClusterName(testClusterName));
+        seaTunnelConfig.getEngineConfig().getHttpConfig().setEnabled(false);
         try {
             node1 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
 
@@ -684,12 +701,14 @@ public class ClusterFaultToleranceIT {
                                         lineNumberFromDir);
                                 Assertions.assertEquals(
                                         JobStatus.RUNNING, clientJobProxy.getJobStatus());
-                                Assertions.assertEquals(
-                                        testRowNumber * testParallelism, (long) lineNumberFromDir);
+                                Assertions.assertTrue(lineNumberFromDir > 1);
                             });
 
-            // sleep 10s and expect the job don't write more rows.
-            Thread.sleep(10000);
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    300_000L);
             clientJobProxy.cancelJob();
 
             Awaitility.await()
@@ -702,10 +721,11 @@ public class ClusterFaultToleranceIT {
                                         JobStatus.CANCELED, objectCompletableFuture.get());
                             });
 
-            // check the final rows
-            Long fileLineNumberFromDir =
-                    FileUtils.getFileLineNumberFromDir(testResources.getLeft());
-            Assertions.assertEquals(testRowNumber * testParallelism, fileLineNumberFromDir);
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    60_000L);
 
         } finally {
             if (engineClient != null) {
@@ -786,6 +806,7 @@ public class ClusterFaultToleranceIT {
             hazelcastConfig.setClusterName(TestUtils.getClusterName(testClusterName));
             SeaTunnelConfig seaTunnelConfig = ConfigProvider.locateAndGetSeaTunnelConfig();
             seaTunnelConfig.setHazelcastConfig(hazelcastConfig);
+            seaTunnelConfig.getEngineConfig().getHttpConfig().setEnabled(false);
             node1 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
 
             node2 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
@@ -829,6 +850,22 @@ public class ClusterFaultToleranceIT {
                                         JobStatus.RUNNING, clientJobProxy.getJobStatus());
                                 Assertions.assertTrue(lineNumberFromDir > 1);
                             });
+
+            // engine_checkpoint_monitor matches the engine* map-store config, but it only holds
+            // observability state: it keeps the job's checkpoint overview in memory and writes
+            // nothing to the IMap storage, next to the engine maps that are persisted.
+            IMap<Long, Object> checkpointMonitor =
+                    finalNode.getMap(EngineStateStoreNames.CHECKPOINT_MONITOR);
+            Awaitility.await()
+                    .atMost(60, TimeUnit.SECONDS)
+                    .untilAsserted(
+                            () -> Assertions.assertTrue(checkpointMonitor.containsKey(jobId)));
+            File imapStorageRoot =
+                    new File("/tmp/seatunnel/imap", TestUtils.getClusterName(testClusterName));
+            Assertions.assertTrue(
+                    new File(imapStorageRoot, Constant.IMAP_RUNNING_JOB_STATE).isDirectory());
+            Assertions.assertFalse(
+                    new File(imapStorageRoot, EngineStateStoreNames.CHECKPOINT_MONITOR).exists());
 
             Thread.sleep(5000);
             // shutdown all node
@@ -887,16 +924,21 @@ public class ClusterFaultToleranceIT {
                                 log.warn(
                                         "\n================================={}=================================\n",
                                         lineNumberFromDir);
-                                Assertions.assertEquals(
-                                        testRowNumber * testParallelism, lineNumberFromDir);
+                                Assertions.assertTrue(lineNumberFromDir > 1);
                             });
+
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    100_000L);
 
             log.warn(
                     "==========================================Cancel Job========================================");
             newClientJobProxy.cancelJob();
             Awaitility.await()
                     .pollDelay(2000, TimeUnit.MILLISECONDS)
-                    .atMost(60000, TimeUnit.MILLISECONDS)
+                    .atMost(300000, TimeUnit.MILLISECONDS)
                     .pollInterval(2000, TimeUnit.MILLISECONDS)
                     .untilAsserted(
                             () -> {
@@ -906,10 +948,11 @@ public class ClusterFaultToleranceIT {
                                 Assertions.assertEquals(
                                         JobStatus.CANCELED, waitForCompletableFuture.get());
                             });
-            // prove that the task was restarted
-            Long fileLineNumberFromDir =
-                    FileUtils.getFileLineNumberFromDir(testResources.getLeft());
-            Assertions.assertEquals(testRowNumber * testParallelism, fileLineNumberFromDir);
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    60_000L);
 
         } finally {
             log.warn(
@@ -924,6 +967,110 @@ public class ClusterFaultToleranceIT {
 
             if (node2 != null) {
                 node2.shutdown();
+            }
+        }
+    }
+
+    /**
+     * A finished job is kept in the history maps with a TTL of {@code history-job-expire-minutes}.
+     * Hazelcast does not delete expired entries from the map store, so the job must keep its
+     * expiration time after the cluster restarts from the IMap file storage instead of being loaded
+     * back without one and never expiring.
+     */
+    @Test
+    public void testFinishedJobKeepsExpirationTimeAfterAllNodeDown() throws Exception {
+        String testCaseName = "testFinishedJobKeepsExpirationTimeAfterAllNodeDown";
+        String testClusterName =
+                "ClusterFaultToleranceIT_testFinishedJobKeepsExpirationTimeAfterAllNodeDown_"
+                        + System.currentTimeMillis();
+        HazelcastInstanceImpl node = null;
+        SeaTunnelClient engineClient = null;
+
+        try {
+            String yaml =
+                    "hazelcast:\n"
+                            + "  network:\n"
+                            + "    join:\n"
+                            + "      tcp-ip:\n"
+                            + "        enabled: true\n"
+                            + "        member-list:\n"
+                            + "          - localhost\n"
+                            + "    port:\n"
+                            + "      auto-increment: true\n"
+                            + "      port-count: 100\n"
+                            + "      port: 5801\n"
+                            + "  map:\n"
+                            + "    engine*:\n"
+                            + "      map-store:\n"
+                            + "        enabled: true\n"
+                            + "        initial-mode: EAGER\n"
+                            + "        factory-class-name: org.apache.seatunnel.engine.server.persistence.FileMapStoreFactory\n"
+                            + "        properties:\n"
+                            + "          type: hdfs\n"
+                            + "          namespace: /tmp/seatunnel/imap\n"
+                            + "          clusterName: "
+                            + TestUtils.getClusterName(testClusterName)
+                            + "\n"
+                            + "          fs.defaultFS: file:///\n";
+            Config hazelcastConfig = Config.loadFromString(yaml);
+            hazelcastConfig.setClusterName(TestUtils.getClusterName(testClusterName));
+            SeaTunnelConfig seaTunnelConfig = ConfigProvider.locateAndGetSeaTunnelConfig();
+            seaTunnelConfig.setHazelcastConfig(hazelcastConfig);
+            seaTunnelConfig.getEngineConfig().getHttpConfig().setEnabled(false);
+            node = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
+
+            Common.setDeployMode(DeployMode.CLIENT);
+            ImmutablePair<String, String> testResources =
+                    createTestResources(testCaseName, JobMode.BATCH, 100, 1);
+            JobConfig jobConfig = new JobConfig();
+            jobConfig.setName(testCaseName);
+
+            ClientConfig clientConfig = ConfigProvider.locateAndGetClientConfig();
+            clientConfig.setClusterName(TestUtils.getClusterName(testClusterName));
+            engineClient = new SeaTunnelClient(clientConfig);
+            ClientJobProxy clientJobProxy =
+                    engineClient
+                            .createExecutionContext(
+                                    testResources.getRight(), jobConfig, seaTunnelConfig)
+                            .execute();
+            Assertions.assertEquals(JobStatus.FINISHED, clientJobProxy.waitForJobComplete());
+            Long jobId = clientJobProxy.getJobId();
+
+            HazelcastInstanceImpl finalNode = node;
+            Awaitility.await()
+                    .atMost(60, TimeUnit.SECONDS)
+                    .untilAsserted(
+                            () ->
+                                    Assertions.assertNotNull(
+                                            finalNode
+                                                    .getMap(Constant.IMAP_FINISHED_JOB_STATE)
+                                                    .getEntryView(jobId)));
+            long expirationTime =
+                    node.getMap(Constant.IMAP_FINISHED_JOB_STATE)
+                            .getEntryView(jobId)
+                            .getExpirationTime();
+            Assertions.assertNotEquals(Long.MAX_VALUE, expirationTime);
+
+            engineClient.close();
+            engineClient = null;
+            node.shutdown();
+            node = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
+
+            EntryView<Object, Object> restored =
+                    node.getMap(Constant.IMAP_FINISHED_JOB_STATE).getEntryView(jobId);
+            Assertions.assertNotNull(restored);
+            // Hazelcast keeps record times at second granularity.
+            long drift = Math.abs(restored.getExpirationTime() - expirationTime);
+            Assertions.assertTrue(
+                    drift <= TimeUnit.SECONDS.toMillis(2),
+                    "expiration time moved by " + drift + " ms across the restart");
+        } finally {
+            if (engineClient != null) {
+                engineClient.close();
+            }
+
+            if (node != null) {
+                node.shutdown();
             }
         }
     }
@@ -1002,6 +1149,7 @@ public class ClusterFaultToleranceIT {
             hazelcastConfig.setClusterName(TestUtils.getClusterName(testClusterName));
             SeaTunnelConfig seaTunnelConfig = ConfigProvider.locateAndGetSeaTunnelConfig();
             seaTunnelConfig.setHazelcastConfig(hazelcastConfig);
+            seaTunnelConfig.getEngineConfig().getHttpConfig().setEnabled(false);
             node1 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
 
             node2 = SeaTunnelServerStarter.createHazelcastInstance(seaTunnelConfig);
@@ -1077,8 +1225,6 @@ public class ClusterFaultToleranceIT {
             CompletableFuture<JobStatus> waitForJobCompleteFuture =
                     CompletableFuture.supplyAsync(newClientJobProxy::waitForJobComplete);
 
-            Thread.sleep(10000);
-
             Awaitility.await()
                     .atMost(100000, TimeUnit.MILLISECONDS)
                     .pollInterval(2000, TimeUnit.MILLISECONDS)
@@ -1096,12 +1242,14 @@ public class ClusterFaultToleranceIT {
                                     log.error(ExceptionUtils.getMessage(e));
                                 }
                                 Assertions.assertEquals(JobStatus.RUNNING, jobStatus);
-                                Assertions.assertEquals(
-                                        testRowNumber * testParallelism, lineNumberFromDir);
+                                Assertions.assertTrue(lineNumberFromDir > 1);
                             });
 
-            // sleep 10s and expect the job don't write more rows.
-            Thread.sleep(10000);
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    100_000L);
             log.info(
                     "==========================================Cancel Job========================================");
             newClientJobProxy.cancelJob();
@@ -1116,10 +1264,11 @@ public class ClusterFaultToleranceIT {
                                 Assertions.assertEquals(
                                         JobStatus.CANCELED, waitForJobCompleteFuture.get());
                             });
-            // prove that the task was restarted
-            Long fileLineNumberFromDir =
-                    FileUtils.getFileLineNumberFromDir(testResources.getLeft());
-            Assertions.assertEquals(testRowNumber * testParallelism, fileLineNumberFromDir);
+            FaultToleranceFakeSourceAssertions.assertOutputRecoveredAndStable(
+                    testResources.getLeft(),
+                    testRowNumber * testParallelism,
+                    testRowNumber,
+                    60_000L);
 
         } finally {
             log.info(

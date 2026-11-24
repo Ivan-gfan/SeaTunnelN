@@ -28,6 +28,10 @@ import ChangeLog from '../changelog/connector-jdbc.md';
 - [x] [column projection](../../introduction/concepts/connector-v2-features.md)
 - [x] [parallelism](../../introduction/concepts/connector-v2-features.md)
 - [x] [support user-defined split](../../introduction/concepts/connector-v2-features.md)
+- [x] [support multiple table read](../../introduction/concepts/connector-v2-features.md)
+- [ ] [cdc](../../introduction/concepts/connector-v2-features.md)
+
+> The PostgreSQL Source connector is a JDBC-based batch connector. It does not tail the PostgreSQL write-ahead log. Use [PostgreSQL-CDC](../source/PostgreSQL-CDC.md) when you need continuous change capture.
 
 > supports query SQL and can achieve projection effect.
 
@@ -55,7 +59,6 @@ Read external data source data through JDBC.
 | BOOL<br/>                                                                                        | BOOLEAN                                                                                                                                        |
 | _BOOL<br/>                                                                                       | ARRAY&LT;BOOLEAN&GT;                                                                                                                           |
 | BYTEA<br/>                                                                                       | BYTES                                                                                                                                          |
-| _BYTEA<br/>                                                                                      | ARRAY&LT;TINYINT&GT;                                                                                                                           |
 | INT2<br/>SMALLSERIAL                                                                             | SMALLINT                                                                                                                                       |
 | _INT2                                                                                            | ARRAY&LT;SMALLINT&GT;                                                                                                                          |
 | INT4<br/>SERIAL<br/>                                                                             | INT                                                                                                                                            |
@@ -70,7 +73,8 @@ Read external data source data through JDBC.
 | NUMERIC(Get the designated column's specified column size<0)                                     | DECIMAL(38, 18)                                                                                                                                |
 | BPCHAR<br/>CHARACTER<br/>VARCHAR<br/>TEXT<br/>GEOMETRY<br/>GEOGRAPHY<br/>JSON<br/>JSONB<br/>UUID | STRING                                                                                                                                         |
 | _BPCHAR<br/>_CHARACTER<br/>_VARCHAR<br/>_TEXT                                                    | ARRAY&LT;STRING&GT;                                                                                                                            |
-| TIMESTAMP(s)<br/>TIMESTAMPTZ(s)                                                                  | TIMESTAMP(s)                                                                                                                                   |
+| TIMESTAMP(s)                                                                                     | TIMESTAMP(s)                                                                                                                                   |
+| TIMESTAMPTZ(s)                                                                                   | TIMESTAMP_TZ(s)                                                                                                                                |
 | TIME(s)<br/>TIMETZ(s)                                                                            | TIME(s)                                                                                                                                        |
 | DATE<br/>                                                                                        | DATE                                                                                                                                           |
 
@@ -79,25 +83,25 @@ Read external data source data through JDBC.
 |                    Name                    |    Type    | Required |     Default     |                                                                                                                                                                                                                                                                                                     Description                                                                                                                                                                                                                                                                                                      |
 |--------------------------------------------|------------|----------|-----------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | url                                        | String     | Yes      | -               | The URL of the JDBC connection. Refer to a case: jdbc:postgresql://localhost:5432/test                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| driver                                     | String     | Yes      | -               | The jdbc class name used to connect to the remote data source,<br/> if you use MySQL the value is `com.mysql.cj.jdbc.Driver`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| driver                                     | String     | Yes      | -               | The jdbc class name used to connect to the remote data source,<br/> if you use PostgreSQL the value is `org.postgresql.Driver`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | username                                       | String     | No       | -               | Connection instance user name                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | password                                   | String     | No       | -               | Connection instance password                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| query                                      | String     | Yes      | -               | Query statement                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| query                                      | String     | No       | -               | Query statement. Required when neither `table_path` nor `table_list` is configured.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | connection_check_timeout_sec               | Int        | No       | 30              | The time in seconds to wait for the database operation used to validate the connection to complete                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| partition_column                           | String     | No       | -               | The column name for parallelism's partition, only support numeric type,Only support numeric type primary key, and only can config one column.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| partition_lower_bound                      | BigDecimal | No       | -               | The partition_column min value for scan, if not set SeaTunnel will query database get min value.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| partition_upper_bound                      | BigDecimal | No       | -               | The partition_column max value for scan, if not set SeaTunnel will query database get max value.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| partition_num                              | Int        | No       | job parallelism | The number of partition count, only support positive integer. default value is job parallelism                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| partition_column                           | String     | No       | -               | The column used to split data for parallel reading. Only one column can be configured, and it must be one of the **Supported split data type** listed in [Parallel Reader](#parallel-reader) (string, number or date).                                                                                                                                                                                                                                                                                                                                                                                                |
+| partition_lower_bound                      | String     | No       | -               | The partition_column min value for scan, if not set SeaTunnel will query database get min value.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| partition_upper_bound                      | String     | No       | -               | The partition_column max value for scan, if not set SeaTunnel will query database get max value.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| partition_num                              | Int        | No       | 10              | The number of partition count, only support positive integer. default value is 10                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | fetch_size                                 | Int        | No       | 0               | For queries that return a large number of objects,you can configure<br/> the row fetch size used in the query toimprove performance by<br/> reducing the number database hits required to satisfy the selection criteria.<br/> Zero means use jdbc default value.                                                                                                                                                                                                                                                                                                                                                    |
 | properties                                 | Map        | No       | -               | Additional connection configuration parameters,when properties and URL have the same parameters, the priority is determined by the <br/>specific implementation of the driver. For example, in MySQL, properties take precedence over the URL.                                                                                                                                                                                                                                                                                                                                                                       |
 | use_regex                                  | Boolean    | No       | false           | Control regular expression matching for table_path. When set to `true`, the table_path will be treated as a regular expression pattern. When set to `false` or not specified, the table_path will be treated as an exact path (no regex matching).                                                                                                                                                                                                                                                                                                                                                                   |
 | table_path                                 | String     | No       | -               | The path to the full path of table, you can use this configuration instead of `query`. <br/>example: <br/>"testdb.test_schema.table1"                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| table_list                                 | Array      | No       | -               | The list of tables to be read, you can use this configuration instead of `table_path` example: ```[{ table_path = "testdb.table1"}, {table_path = "testdb.table2", query = "select * id, name from testdb.table2"}]```                                                                                                                                                                                                                                                                                                                                                                                               |
+| table_list                                 | Array      | No       | -               | The list of tables to be read, you can use this configuration instead of `table_path` example: ```[{ table_path = "testdb.table1"}, {table_path = "testdb.table2", query = "select id, name from testdb.table2"}]```                                                                                                                                                                                                                                                                                                                                                                                               |
 | where_condition                            | String     | No       | -               | Common row filter conditions for all tables/queries, must start with `where`. for example `where id > 100`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | split.size                                 | Int        | No       | 8096            | The split size (number of rows) of table, captured tables are split into multiple splits when read of table.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | split.even-distribution.factor.lower-bound | Double     | No       | 0.05            | The lower bound of the chunk key distribution factor. This factor is used to determine whether the table data is evenly distributed. If the distribution factor is calculated to be greater than or equal to this lower bound (i.e., (MAX(id) - MIN(id) + 1) / row count), the table chunks would be optimized for even distribution. Otherwise, if the distribution factor is less, the table will be considered as unevenly distributed and the sampling-based sharding strategy will be used if the estimated shard count exceeds the value specified by `sample-sharding.threshold`. The default value is 0.05.  |
 | split.even-distribution.factor.upper-bound | Double     | No       | 100             | The upper bound of the chunk key distribution factor. This factor is used to determine whether the table data is evenly distributed. If the distribution factor is calculated to be less than or equal to this upper bound (i.e., (MAX(id) - MIN(id) + 1) / row count), the table chunks would be optimized for even distribution. Otherwise, if the distribution factor is greater, the table will be considered as unevenly distributed and the sampling-based sharding strategy will be used if the estimated shard count exceeds the value specified by `sample-sharding.threshold`. The default value is 100.0. |
-| split.sample-sharding.threshold            | Int        | No       | 10000           | This configuration specifies the threshold of estimated shard count to trigger the sample sharding strategy. When the distribution factor is outside the bounds specified by `chunk-key.even-distribution.factor.upper-bound` and `chunk-key.even-distribution.factor.lower-bound`, and the estimated shard count (calculated as approximate row count / chunk size) exceeds this threshold, the sample sharding strategy will be used. This can help to handle large datasets more efficiently. The default value is 1000 shards.                                                                                   |
+| split.sample-sharding.threshold            | Int        | No       | 1000            | This configuration specifies the threshold of estimated shard count to trigger the sample sharding strategy. When the distribution factor is outside the bounds specified by `chunk-key.even-distribution.factor.upper-bound` and `chunk-key.even-distribution.factor.lower-bound`, and the estimated shard count (calculated as approximate row count / chunk size) exceeds this threshold, the sample sharding strategy will be used. This can help to handle large datasets more efficiently. The default value is 1000 shards.                                                                                   |
 | split.inverse-sampling.rate                | Int        | No       | 1000            | The inverse of the sampling rate used in the sample sharding strategy. For example, if this value is set to 1000, it means a 1/1000 sampling rate is applied during the sampling process. This option provides flexibility in controlling the granularity of the sampling, thus affecting the final number of shards. It's especially useful when dealing with very large datasets where a lower sampling rate is preferred. The default value is 1000.                                                                                                                                                              |
 | common-options                             |            | No       | -               | Source plugin common parameters, please refer to [Source Common Options](../common-options/source-common-options.md) for details                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
@@ -145,11 +149,11 @@ The inverse of the sampling rate used in the sample sharding strategy. For examp
 
 The column name for split data.
 
-#### partition_upper_bound [BigDecimal]
+#### partition_upper_bound [string]
 
 The partition_column max value for scan, if not set SeaTunnel will query database get max value.
 
-#### partition_lower_bound [BigDecimal]
+#### partition_lower_bound [string]
 
 The partition_column min value for scan, if not set SeaTunnel will query database get min value.
 
@@ -157,7 +161,7 @@ The partition_column min value for scan, if not set SeaTunnel will query databas
 
 > Not recommended for use, The correct approach is to control the number of split through `split.size`
 
-How many splits do we need to split into, only support positive integer. default value is job parallelism.
+How many splits do we need to split into, only support positive integer. default value is 10.
 
 ## tips
 
@@ -189,7 +193,7 @@ source{
 }
 
 transform {
-    # please go to https://seatunnel.apache.org/docs/transform-v2/sql
+    # please go to https://seatunnel.apache.org/docs/transforms/sql
 }
 
 sink {
@@ -306,6 +310,74 @@ source {
 
 sink {
   Console {}
+}
+```
+
+### Streaming With Incremental ID Range
+
+The PostgreSQL Source connector is a JDBC-based batch reader. Setting `job.mode = "STREAMING"` only enables checkpointing so the job can resume on failure; the source itself is bounded and reads the configured `[partition_lower_bound, partition_upper_bound)` range exactly once per job run. To pick up new rows repeatedly you must externally resubmit the job (for example on a schedule, with a sliding window), or use [PostgreSQL-CDC](../source/PostgreSQL-CDC.md) for continuous change capture.
+
+```hocon
+env {
+  parallelism = 4
+  job.mode = "STREAMING"
+  checkpoint.interval = 60000
+}
+
+source {
+  Jdbc {
+    url = "jdbc:postgresql://datasource01:5432/demo"
+    driver = "org.postgresql.Driver"
+    username = "postgres"
+    password = "postgres"
+    query = "SELECT * FROM orders WHERE id >= ? AND id < ?"
+    partition_column = "id"
+    partition_lower_bound = 1
+    partition_upper_bound = 1000000
+    partition_num = 16
+  }
+}
+```
+
+### Read With Schema Prefix
+
+PostgreSQL uses `database.schema.table` as the qualified name. When `url` does not include the target database, pass the schema explicitly via `table_path` in the `database.schema.table` form.
+
+```hocon
+source {
+  Jdbc {
+    url = "jdbc:postgresql://datasource01:5432/demo"
+    driver = "org.postgresql.Driver"
+    username = "postgres"
+    password = "postgres"
+    table_path = "demo.public.orders"
+    split.size = 10000
+  }
+}
+```
+
+### Read With Per-Table Query Override
+
+When tables in `table_list` need different projections or filters, set `query` per entry. SeaTunnel uses the per-item SQL verbatim and skips table metadata lookup for that entry.
+
+```hocon
+source {
+  Jdbc {
+    url = "jdbc:postgresql://datasource01:5432/demo"
+    driver = "org.postgresql.Driver"
+    username = "postgres"
+    password = "postgres"
+    table_list = [
+      {
+        table_path = "demo.public.orders"
+        query = "select id, status, amount from orders where status = 'PAID'"
+      },
+      {
+        table_path = "demo.public.refunds"
+        query = "select id, order_id, amount from refunds where amount > 0"
+      }
+    ]
+  }
 }
 ```
 

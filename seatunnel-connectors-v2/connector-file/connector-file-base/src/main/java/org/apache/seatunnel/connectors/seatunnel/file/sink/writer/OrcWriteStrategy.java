@@ -55,6 +55,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.temporal.ChronoField;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -70,7 +71,7 @@ public class OrcWriteStrategy extends AbstractWriteStrategy<Writer> {
     }
 
     @Override
-    public void write(@NonNull SeaTunnelRow seaTunnelRow) {
+    public synchronized void write(@NonNull SeaTunnelRow seaTunnelRow) {
         super.write(seaTunnelRow);
         String filePath = getOrCreateFilePathBeingWritten(seaTunnelRow);
         Writer writer = getOrCreateOutputStream(filePath);
@@ -79,7 +80,7 @@ public class OrcWriteStrategy extends AbstractWriteStrategy<Writer> {
         int i = 0;
         int row = rowBatch.size++;
         for (Integer index : sinkColumnsIndexInRow) {
-            Object value = seaTunnelRow.getField(index);
+            Object value = getFieldSafe(seaTunnelRow, index);
             ColumnVector vector = rowBatch.cols[i];
             setColumn(value, vector, row);
             i++;
@@ -96,7 +97,14 @@ public class OrcWriteStrategy extends AbstractWriteStrategy<Writer> {
     }
 
     @Override
-    public void finishAndCloseFile() {
+    public synchronized void newFilePart() {
+        finishAndCloseFile();
+        super.newFilePart();
+    }
+
+    @Override
+    public synchronized void finishAndCloseFile() {
+        List<FileConnectorException> closeErrors = new ArrayList<>();
         this.beingWrittenWriter.forEach(
                 (k, v) -> {
                     try {
@@ -106,18 +114,23 @@ public class OrcWriteStrategy extends AbstractWriteStrategy<Writer> {
                             rowBatch.reset();
                         }
                         v.close();
+                        needMoveFiles.put(k, getTargetLocation(k));
                     } catch (IOException e) {
-                        String errorMsg =
-                                String.format(
-                                        "Close file [%s] orc writer failed, error msg: [%s]",
-                                        k, e.getMessage());
-                        throw new FileConnectorException(
-                                CommonErrorCodeDeprecated.WRITER_OPERATION_FAILED, errorMsg, e);
+                        closeErrors.add(
+                                new FileConnectorException(
+                                        CommonErrorCodeDeprecated.WRITER_OPERATION_FAILED,
+                                        String.format(
+                                                "Close file [%s] orc writer failed, error"
+                                                        + " msg: [%s]",
+                                                k, e.getMessage()),
+                                        e));
                     }
-                    needMoveFiles.put(k, getTargetLocation(k));
                 });
         this.vectorizedRowBatches.clear();
         this.beingWrittenWriter.clear();
+        if (!closeErrors.isEmpty()) {
+            throw closeErrors.get(0);
+        }
     }
 
     private VectorizedRowBatch getOrCreateVectorizedRowBatch(@NonNull String filePath) {
@@ -200,7 +213,7 @@ public class OrcWriteStrategy extends AbstractWriteStrategy<Writer> {
                 SeaTunnelDataType<?>[] fieldTypes = ((SeaTunnelRowType) type).getFieldTypes();
                 for (int i = 0; i < fieldTypes.length; i++) {
                     struct.addField(
-                            ((SeaTunnelRowType) type).getFieldName(i).toLowerCase(),
+                            ((SeaTunnelRowType) type).getFieldName(i),
                             buildFieldWithRowType(fieldTypes[i]));
                 }
                 return struct;
@@ -336,7 +349,30 @@ public class OrcWriteStrategy extends AbstractWriteStrategy<Writer> {
     private void setDecimalColumnVector(
             Object value, DecimalColumnVector decimalColumnVector, int row) {
         if (value instanceof BigDecimal) {
-            decimalColumnVector.set(row, HiveDecimal.create((BigDecimal) value));
+            BigDecimal decimal = (BigDecimal) value;
+            // Both of these return null rather than throwing, and DecimalColumnVector.set then
+            // just marks the cell null, so an unchecked conversion writes the row with the value
+            // silently gone. HiveDecimal.create returns null above ORC's maximum precision of 38;
+            // enforcePrecisionScale returns null when the value does not fit the column actually
+            // declared, which is the reachable case for an inferred or narrow precision. The
+            // Parquet sink in this module already refuses the same overflow loudly.
+            HiveDecimal hiveDecimal = HiveDecimal.create(decimal);
+            HiveDecimal enforced =
+                    hiveDecimal == null
+                            ? null
+                            : HiveDecimal.enforcePrecisionScale(
+                                    hiveDecimal,
+                                    decimalColumnVector.precision,
+                                    decimalColumnVector.scale);
+            if (enforced == null) {
+                throw new FileConnectorException(
+                        CommonErrorCodeDeprecated.ILLEGAL_ARGUMENT,
+                        String.format(
+                                "Decimal value [%s] does not fit the target ORC column decimal(%d,%d). "
+                                        + "Widen the declared precision or scale, or round the value before writing.",
+                                decimal, decimalColumnVector.precision, decimalColumnVector.scale));
+            }
+            decimalColumnVector.set(row, enforced);
         } else {
             String errorMsg =
                     String.format(

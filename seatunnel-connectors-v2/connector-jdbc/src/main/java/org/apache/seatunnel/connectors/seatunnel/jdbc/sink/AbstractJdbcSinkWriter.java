@@ -17,11 +17,13 @@
 
 package org.apache.seatunnel.connectors.seatunnel.jdbc.sink;
 
+import org.apache.seatunnel.api.common.SeaTunnelAPIErrorCode;
 import org.apache.seatunnel.api.sink.SinkWriter;
 import org.apache.seatunnel.api.sink.SupportMultiTableSinkWriter;
 import org.apache.seatunnel.api.sink.SupportSchemaEvolutionSinkWriter;
 import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.catalog.TableSchema;
+import org.apache.seatunnel.api.table.schema.event.RestoreTableSchemaEvent;
 import org.apache.seatunnel.api.table.schema.event.SchemaChangeEvent;
 import org.apache.seatunnel.api.table.schema.handler.TableSchemaChangeEventDispatcher;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
@@ -40,6 +42,7 @@ import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.sql.Connection;
+import java.util.Optional;
 
 @Slf4j
 public abstract class AbstractJdbcSinkWriter<ResourceT>
@@ -55,26 +58,56 @@ public abstract class AbstractJdbcSinkWriter<ResourceT>
     protected JdbcConnectionProvider connectionProvider;
     protected JdbcSinkConfig jdbcSinkConfig;
     protected JdbcOutputFormat<SeaTunnelRow, JdbcBatchStatementExecutor<SeaTunnelRow>> outputFormat;
+
+    /**
+     * Whether every successful batch flush should commit the connection when it uses manual commit.
+     * Only the non-XA writer sets this to true, and only when checkpointing is disabled, so rebuilt
+     * output formats keep the same commit boundary after schema changes.
+     */
+    protected boolean commitOnFlush;
+
     protected TableSchemaChangeEventDispatcher tableSchemaChanger =
             new TableSchemaChangeEventDispatcher();
 
     @Override
     public void applySchemaChange(SchemaChangeEvent event) throws IOException {
+        if (!(event instanceof RestoreTableSchemaEvent) && !dialect.supportsSchemaChange()) {
+            throw new JdbcConnectorException(
+                    SeaTunnelAPIErrorCode.CONFIG_VALIDATION_FAILED,
+                    dialect.dialectName() + " JDBC dialect does not support schema changes");
+        }
         this.tableSchema = tableSchemaChanger.reset(tableSchema).apply(event);
         reOpenOutputFormat(event);
     }
 
+    /**
+     * Exposes the resolved physical JDBC sink table so the multi-table coordinator can fan schema
+     * changes out to every sibling writer that shares the same destination table.
+     */
+    @Override
+    public Optional<String> getPhysicalSinkTableIdentifier() {
+        return sinkTablePath == null ? Optional.empty() : Optional.of(sinkTablePath.getFullName());
+    }
+
     protected void reOpenOutputFormat(SchemaChangeEvent event) throws IOException {
         this.prepareCommit();
-        JdbcConnectionProvider refreshTableSchemaConnectionProvider =
-                dialect.getJdbcConnectionProvider(jdbcSinkConfig.getJdbcConnectionConfig());
-        try (Connection connection =
-                refreshTableSchemaConnectionProvider.getOrEstablishConnection()) {
-            dialect.applySchemaChange(connection, sinkTablePath, event);
-        } catch (Throwable e) {
-            throw new JdbcConnectorException(
-                    JdbcConnectorErrorCode.REFRESH_PHYSICAL_TABLESCHEMA_BY_SCHEMA_CHANGE_EVENT, e);
+        if (!(event instanceof RestoreTableSchemaEvent)) {
+            JdbcConnectionProvider refreshTableSchemaConnectionProvider =
+                    dialect.getJdbcConnectionProvider(jdbcSinkConfig.getJdbcConnectionConfig());
+            try (Connection connection =
+                    refreshTableSchemaConnectionProvider.getOrEstablishConnection()) {
+                dialect.applySchemaChange(connection, sinkTablePath, event);
+            } catch (Throwable e) {
+                throw new JdbcConnectorException(
+                        JdbcConnectorErrorCode.REFRESH_PHYSICAL_TABLESCHEMA_BY_SCHEMA_CHANGE_EVENT,
+                        e);
+            }
+        } else {
+            log.info(
+                    "Restore runtime schema for table {} without applying physical DDL",
+                    sinkTablePath);
         }
+
         this.outputFormat =
                 new JdbcOutputFormatBuilder(
                                 dialect,
@@ -82,6 +115,7 @@ public abstract class AbstractJdbcSinkWriter<ResourceT>
                                 jdbcSinkConfig,
                                 tableSchema,
                                 databaseTableSchema)
+                        .commitOnFlush(commitOnFlush)
                         .build();
         this.outputFormat.open();
     }

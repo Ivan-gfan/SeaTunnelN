@@ -6,7 +6,7 @@ import ChangeLog from '../changelog/connector-iceberg.md';
 
 ## 支持 Iceberg 版本
 
-- 1.6.1
+- 1.10.2，支持读取表格式版本（format version）1、2 和 3 的表
 
 ## 支持这些引擎
 
@@ -64,6 +64,10 @@ libfb303-xxx.jar
 | DATE              | DATE                |
 | TIME              | TIME                |
 | TIMESTAMP         | TIMESTAMP           |
+| TIMESTAMPTZ       | TIMESTAMP_TZ        |
+| TIMESTAMP_NS      | TIMESTAMP，scale 9  |
+| TIMESTAMPTZ_NS    | TIMESTAMP_TZ，scale 9 |
+| UNKNOWN           | NULL                |
 | STRING            | STRING              |
 | FIXED<br/>BINARY  | BYTES               |
 | DECIMAL           | DECIMAL             |
@@ -71,15 +75,19 @@ libfb303-xxx.jar
 | LIST              | ARRAY               |
 | MAP               | MAP                 |
 
+列表（`LIST`）仅在元素类型为 `BOOLEAN`、`INT`、`BIGINT`、`FLOAT`、`DOUBLE` 或 `STRING` 时才能读取；其他元素类型（例如嵌套 STRUCT 或 DECIMAL）的列表会导致作业失败。
+
+`TIMESTAMP_NS`、`TIMESTAMPTZ_NS` 和 `UNKNOWN` 仅存在于格式版本 3 的表中。纳秒时间戳保留纳秒精度，并以列精度（scale）9 表示。暂不支持 `VARIANT`、`GEOMETRY` 和 `GEOGRAPHY` 列，读取时作业会失败；可通过 `query` 选项排除这些列，例如 `select id, ts from table`。被 deletion vector 删除的行不会被读取。不会读取行血缘（row lineage）字段（`_row_id`、`_last_updated_sequence_number`）。
+
 ## 源选项
 
 | 参数名                     | 类型    | 必须 | 默认值              | 描述                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 |--------------------------|---------|------|----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| catalog_name             | string  | 是   | -                    | 用户指定的目录名称。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| namespace                | string  | 是   | -                    | 后端目录中的 iceberg 数据库名称。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| table                    | string  | 否   | -                    | 后端目录中的 iceberg 表名称。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| table_list               | string  | 否   | -                    | 后端目录中的 iceberg 表列表。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| iceberg.catalog.config   | map     | 是   | -                    | 指定初始化 Iceberg 目录的属性，可以在此文件中引用：https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/CatalogProperties.java                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| catalog_name             | string  | 否   | default              | 用户指定的目录名称。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| namespace                | string  | 否   | default              | 后端目录中的 iceberg 数据库名称。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| table                    | string  | 否   | -                    | 后端目录中的 Iceberg 表名称。`table` 和 `table_list` 必须二选一配置，不能同时配置。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| table_list               | list    | 否   | -                    | 后端目录中的 Iceberg 表列表。`table` 和 `table_list` 必须二选一配置，不能同时配置。每一项都可以配置 `table`、`query` 以及该表自己的快照/流式扫描参数。注意：每一项的键使用驼峰命名（例如 `startSnapshotId`、`streamScanStrategy`），详见[多表读取](#多表读取)。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| iceberg.catalog.config   | map     | 是   | -                    | 指定初始化 Iceberg 目录的属性，可以在此文件中引用：[CatalogProperties.java](https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/CatalogProperties.java)                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | hadoop.config            | map     | 否   | -                    | 传递给 Hadoop 配置的属性                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | iceberg.hadoop-conf-path | string  | 否   | -                    | 为 'core-site.xml'、'hdfs-site.xml'、'hive-site.xml' 文件指定的加载路径。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | schema                   | config  | 否   | -                    | 使用投影来选择数据列和列顺序。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -90,10 +98,26 @@ libfb303-xxx.jar
 | use_snapshot_id          | long    | 否   | -                    | 指示此扫描使用给定的快照 ID。                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | use_snapshot_timestamp   | long    | 否   | -                    | 指示此扫描使用给定时间（毫秒）的最新快照。timestamp – 自 Unix 纪元以来的时间戳（毫秒）                                                                                                                                                                                                                                                                                                                                                            |
 | stream_scan_strategy     | enum    | 否   | FROM_LATEST_SNAPSHOT | 流模式执行的启动策略，如果不指定任何值，默认使用 `FROM_LATEST_SNAPSHOT`，可选值为：<br/>TABLE_SCAN_THEN_INCREMENTAL：执行常规表扫描，然后切换到增量模式。<br/>FROM_LATEST_SNAPSHOT：从最新快照（包含）开始增量模式。<br/>FROM_EARLIEST_SNAPSHOT：从最早快照（包含）开始增量模式。<br/>FROM_SNAPSHOT_ID：从具有特定 id（包含）的快照开始增量模式。<br/>FROM_SNAPSHOT_TIMESTAMP：从具有特定时间戳（包含）的快照开始增量模式。 |
-| increment.scan-interval  | long    | 否   | 2000                 | 增量扫描的间隔（毫秒）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| increment.scan-interval  | long    | 否   | 2000                 | 增量扫描的间隔（毫秒），必须为正数                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | common-options           |         | 否   | -                    | 源插件通用参数，请参考 [源通用选项](../common-options/source-common-options.md) 详见。                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| query                    | String  | 否   | -                    | 用于选择 iceberg 数据的 select DML。它不能包含表名，也不支持别名。例如：`select * from table where f1 > 100`、`select fn from table where f1 > 100`。当前对 LIKE 语法的支持是有限的：LIKE 子句不应以 `%` 开头。支持的是：`select f1 from t where f2 like 'tom%'  `                                                                                                                                                                                                                                                       |
+| query                    | String  | 否   | -                    | 用于过滤或投影 Iceberg 数据的 select DML。这里使用固定占位表名 `table`，不要写真实表名，也不支持表别名。例如：`select * from table where f1 > 100`、`select fn from table where f1 > 100`。当前对 LIKE 语法的支持有限：LIKE 模式不应以 `%` 开头，例如 `select f1 from table where f2 like 'tom%'`。                                                                                                                                                                                                                                                       |
+| krb5_path                              | string  | 否       | /etc/krb5.conf              | `krb5.conf` 文件的路径，用于 Kerberos 认证。                                                                                                                                                                                                                                                                |
+| kerberos_principal                     | string  | 否       | -                            | Kerberos 认证的 principal。                                                                                                                                                                                                                                                                               |
+| kerberos_keytab_path                   | string  | 否       | -                            | Kerberos 认证的 keytab 文件路径。                                                                                                                                                                                                                                                                         |
 
+## 源选项说明
+
+### krb5_path [string]
+
+`krb5.conf` 文件的路径，用于 Kerberos 认证。
+
+### kerberos_principal [string]
+
+Kerberos 认证的 principal。
+
+### kerberos_keytab_path [string]
+
+Kerberos 认证的 keytab 文件路径。
 
 ## 任务示例
 
@@ -131,6 +155,25 @@ sink {
 
 ### 多表读取
 
+一个 Iceberg Source 需要读取多张表时使用 `table_list`，不要同时配置 `table`。
+
+`table_list` 的每一项按独立配置解析，支持以下每表级别的键。注意：与根级别选项不同，这些键使用驼峰命名（camelCase）：
+
+| 每表键                   | 类型   | 描述                                                                                   |
+|-------------------------|--------|----------------------------------------------------------------------------------------|
+| namespace               | string | 不生效：每一项都会被根级别 `namespace` 覆盖。如需读取其他数据库，请在 `table` 中使用限定名 `db.table`。 |
+| table                   | string | Iceberg 表名。                                                                     |
+| query                   | string | 该表的过滤 query，含义与根级别 `query` 选项相同。                                      |
+| startSnapshotTimestamp  | long   | 自 Unix 纪元以来的毫秒时间戳；从该时间点最近的快照开始扫描变更。                        |
+| startSnapshotId         | long   | 从指定快照（不包含）开始扫描变更。                                                      |
+| endSnapshotId           | long   | 扫描变更直到指定快照（包含）。                                                          |
+| useSnapshotId           | long   | 批量模式下读取指定快照。                                                                |
+| useSnapshotTimestamp    | long   | 自 Unix 纪元以来的毫秒时间戳；批量模式下读取该时间点最近的快照。                        |
+| streamScanStrategy      | enum   | 该表的流式扫描策略。可选值：`FROM_LATEST_SNAPSHOT`（默认）、`TABLE_SCAN_THEN_INCREMENTAL`、`FROM_EARLIEST_SNAPSHOT`、`FROM_SNAPSHOT_ID`、`FROM_SNAPSHOT_TIMESTAMP`。 |
+| splitSize               | long   | 该表的目标 split 大小（字节），对应 Iceberg `read.split.target-size`。                   |
+| splitLookback           | int    | 合并 split 时向前查看的 manifest 数量，对应 Iceberg `read.split.planning-lookback`。     |
+| splitOpenFileCost       | long   | 打开一个文件的估算开销，用于合并 split，对应 Iceberg `read.split.openfile-cost`。        |
+
 ```hocon
 source {
   Iceberg {
@@ -159,7 +202,7 @@ source {
 
 ```hocon
 source {
-  iceberg {
+  Iceberg {
     catalog_name = "seatunnel"
     iceberg.catalog.config={
       "type"="hadoop"
@@ -190,13 +233,40 @@ source {
       uri = "thrift://localhost:9083"
       warehouse = "hdfs://your_cluster//tmp/seatunnel/iceberg/"
     }
-    catalog_type = "hive"
 
     namespace = "your_iceberg_database"
     table = "your_iceberg_table"
   }
 }
 ```
+
+### Kerberos 认证
+
+以下示例演示了在使用 Hadoop Catalog 和 HDFS 时如何配置 Iceberg Source 的 Kerberos 认证：
+
+```hocon
+source {
+  Iceberg {
+    catalog_name = "seatunnel"
+    iceberg.catalog.config = {
+      type = "hadoop"
+      warehouse = "hdfs://your_cluster/tmp/seatunnel/iceberg/"
+    }
+    namespace = "your_iceberg_database"
+    table = "your_iceberg_table"
+    krb5_path = "/etc/krb5.conf"
+    kerberos_principal = "hive/your_host@EXAMPLE.COM"
+    kerberos_keytab_path = "/path/to/your.keytab"
+    plugin_output = "iceberg_kerberos"
+  }
+}
+```
+
+说明：
+
+- `krb5_path`：用于 Kerberos 认证的 `krb5.conf` 文件路径。
+- `kerberos_principal`：Kerberos 认证的 principal，格式为 `primary/instance@REALM`。
+- `kerberos_keytab_path`：Kerberos 认证的 keytab 文件路径。
 
 ### 列投影
 
@@ -226,5 +296,4 @@ source {
 ## 变更日志
 
 <ChangeLog />
-
 

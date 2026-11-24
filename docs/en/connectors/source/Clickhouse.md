@@ -40,13 +40,15 @@ They can be downloaded via install-plugin.sh or from the Maven central repositor
 |                                                             Clickhouse Data Type                                                              | SeaTunnel Data Type |
 |-----------------------------------------------------------------------------------------------------------------------------------------------|---------------------|
 | String / Int128 / UInt128 / Int256 / UInt256 / Point / Ring / Polygon MultiPolygon                                                            | STRING              |
-| Int8 / UInt8 / Int16 / UInt16 / Int32                                                                                                         | INT                 |
+| Int8                                                                                                                                          | TINYINT             |
+| UInt8 / Int16                                                                                                                                 | SMALLINT            |
+| UInt16 / Int32                                                                                                                                | INT                 |
 | UInt64 / Int64 / IntervalYear / IntervalQuarter / IntervalMonth / IntervalWeek / IntervalDay / IntervalHour / IntervalMinute / IntervalSecond | BIGINT              |
 | Float64                                                                                                                                       | DOUBLE              |
 | Decimal                                                                                                                                       | DECIMAL             |
 | Float32                                                                                                                                       | FLOAT               |
 | Date                                                                                                                                          | DATE                |
-| DateTime                                                                                                                                      | TIME                |
+| DateTime                                                                                                                                      | TIMESTAMP           |
 | Array                                                                                                                                         | ARRAY               |
 | Map                                                                                                                                           | MAP                 |
 
@@ -70,9 +72,10 @@ Table list configuration:
 | sql               | String | NO       | -                      | The query sql used to search data though Clickhouse server.                                                                                                                                                                                                                                                 |
 | filter_query      | String | NO       | -                      | Data filtering in Clickhouse. the format is "field = value", example : filter_query = "id > 2 and type = 1"                                                                                                                                                                                                 |
 | partition_list    | Array  | NO       | -                      | Table partition list to filter the specified partition. If it is a partitioned table, this field can be configured to filter the data of the specified partition. example: partition_list = ["20250615", "20250616"]                                                                                        |
+| split_size        | int    | NO       | Integer.MAX_VALUE      | The number of ClickHouse parts grouped into each SeaTunnel split when configured inside `table_list`. Use `split.size` only when this option is flattened to the outer source level. The minimum value is `1`. Smaller values create more splits for higher parallelism.                                         |
 | batch_size        | int    | NO       | 1024                   | The maximum rows of data that can be obtained by reading from Clickhouse once.                                                                                                                                                                                                                              |
 
-Note: When this configuration corresponds to a single table, you can flatten the configuration items in table_list to the outer layer.
+Note: When this configuration corresponds to a single table, you can flatten the configuration items in table_list to the outer layer. In that flattened form, configure `split.size` instead of `split_size`.
 
 ## Parallel Reader
 The Clickhouse source connector supports parallel reading of data.
@@ -87,7 +90,8 @@ If both the `table_path` and `sql` parameters are set, it will be executed in sq
 ## Tips
 In query table mode, if you don't want to read the entire table, you can specify the `partition_list` or `filter_query` parameter. 
 * `partition_list`: filter the data of the specified partition
-* `filter_query`: filter the data based on the specified conditions
+* `filter_query`: filter the data based on the specified conditions. It can also be used together with `sql`; SeaTunnel applies it as an additional ClickHouse-side filter.
+* `split.size`: control how many ClickHouse parts are grouped into one SeaTunnel split when reading by `table_path`
 
 The `batch_size` parameter can be used to control the amount of data read each time to avoid OOM exception when reading a large amount of data. Appropriately increasing this value will help to improve the performance of the reading process.
 
@@ -114,6 +118,7 @@ source {
     server_time_zone = "UTC"
     partition_list = ["20250615", "20250616"]
     filter_query = "id > 2 and type = 1"
+    split.size = 1
     batch_size = 1024
     clickhouse.config = {
       "socket_timeout": "300000"
@@ -194,25 +199,30 @@ sink {
 ```
 
 ### Multiple table
+
+When `table_list` contains multiple entries, SeaTunnel emits one row stream per upstream table and uses `${table_name}` in
+the downstream connector to route each stream to the matching target. Combine this with the Clickhouse sink's
+`table = "${table_name}_multi_table_sink"` style configuration to land each upstream table in its own target table.
+
 ```hocon
 env {
   job.mode = "BATCH"
-  parallelism = 5
+  parallelism = 3
 }
 
 source {
   Clickhouse {
     host = "localhost:8123"
-    username = "xxx"
-    password = "xxx"
+    username = "default"
+    password = ""
     table_list = [
       {
-        table_path = "default.table1"
-        sql = "select * from default.table1 where id > 2 and type = 1"
+        table_path = "default.source_table"
+        sql = "select * from source_table"
       },
       {
-        table_path = "default.table2"
-        sql = "select * from default.table2 where age > 18"
+        table_path = "default.source_merge_tree_table"
+        filter_query = "id < 47"
       }
     ]
     server_time_zone = "UTC"
@@ -222,13 +232,45 @@ source {
   }
 }
 
-# Console printing of the read Clickhouse data
+# Each upstream table is written to a separate target table.
 sink {
-  Console {
-    parallelism = 1
+  Clickhouse {
+    host = "localhost:8123"
+    database = "default"
+    table = "${table_name}_multi_table_sink"
+    username = "default"
+    password = ""
   }
 }
 ```
+
+## FAQ
+
+### How do I read only some partitions or rows of a ClickHouse table?
+
+Prefer `partition_list` to filter partitions or `filter_query` to apply a server-side predicate. Both avoid full-table
+scans when the upstream table is large. Combine them with `sql` if you also need to project specific columns; in that
+case the connector runs in SQL mode and uses the partition/filter hints alongside the user query.
+
+### When should I use SQL mode vs query table mode?
+
+Use SQL mode (`sql` is set) when you need joins, aggregations, subqueries, or projections on multiple tables. Use
+query table mode (`table_path` only) when you want to read one logical table with parallel `system.parts`-based
+splits and the lowest read latency. The connector falls back to single parallelism for any SQL that needs to run
+on a single shard, even when a higher `parallelism` is configured.
+
+### How do I tune read throughput and memory pressure?
+
+The two main knobs are `split.size` (how many ClickHouse parts are grouped into one SeaTunnel split) and `batch_size`
+(how many rows are pulled per round-trip). Decrease `split.size` to raise parallelism on small part counts, and
+increase `batch_size` to amortise round-trip cost on larger parts. The `clickhouse.config` map exposes every
+`clickhouse-jdbc` option for further tuning, for example `socket_timeout`.
+
+### How are `table_list` and a single `table_path` related?
+
+When the configuration has exactly one logical table, you can flatten the table-list entry to the outer level and
+configure `split.size` (note the dot) instead of `split_size`. With multiple entries in `table_list`, keep each
+table's options inside its own entry and keep `split_size` inside the entry.
 
 ## Changelog
 

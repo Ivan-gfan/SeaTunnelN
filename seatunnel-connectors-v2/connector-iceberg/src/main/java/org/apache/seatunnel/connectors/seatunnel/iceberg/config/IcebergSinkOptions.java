@@ -55,7 +55,10 @@ public class IcebergSinkOptions extends IcebergCommonOptions {
                     .stringType()
                     .noDefaultValue()
                     .withDescription(
-                            "Default comma-separated list of columns that identify a row in tables (primary key)");
+                            "Default comma-separated list of columns that identify a row in tables (primary key). "
+                                    + "Required and must be non-blank when 'iceberg.table.upsert-mode-enabled' is true: "
+                                    + "upsert mode needs an explicit primary-key list because the source table primary key "
+                                    + "is no longer inherited automatically (see: apache/seatunnel#10747)");
 
     public static final Option<String> TABLE_DEFAULT_PARTITION_KEYS =
             Options.key("iceberg.table.partition-keys")
@@ -93,4 +96,14 @@ public class IcebergSinkOptions extends IcebergCommonOptions {
                     .stringType()
                     .noDefaultValue()
                     .withDescription("Default branch for commits");
+
+    public static final Option<Long> FLUSH_ROW_SIZE =
+            Options.key("flush_row_size")
+                    .longType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Maximum number of rows a sink writer handles before it closes its"
+                                    + " current files and starts new ones, instead of keeping them"
+                                    + " open until the next checkpoint. Must be greater than 0."
+                                    + " Not set means the writer is only rotated at checkpoints.");
 }

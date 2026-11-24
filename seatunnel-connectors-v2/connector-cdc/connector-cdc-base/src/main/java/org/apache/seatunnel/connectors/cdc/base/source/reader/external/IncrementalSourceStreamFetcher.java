@@ -64,6 +64,16 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
     private final Set<TableId> pureBinlogPhaseTables;
     private volatile ChangeEventQueue<DataChangeEvent> queue;
     private volatile Throwable readException;
+    private volatile boolean taskStarted = false;
+    // Set synchronously in submitTask(), before the fetch task is handed to the background
+    // thread, and cleared in a finally block once execute() returns/throws. isFinished() must
+    // not rely on polling streamFetchTask.isRunning() alone: that flag is owned by the fetch
+    // task and is only flipped to true from inside its own execute() method, which the
+    // (single-threaded) poller can observe as not-yet-run. Without this flag isFinished() could
+    // report the split as finished before the fetch task ever ran, silently truncating the whole
+    // incremental/bounded read (see bug-002/bug-008). Setting it inside the background thread's
+    // lambda instead of synchronously in submitTask() re-opens this exact race.
+    private volatile boolean executing = false;
 
     private FetchTask<SourceSplitBase> streamFetchTask;
 
@@ -75,6 +85,8 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
     private Map<TableId, Offset> maxSplitHighWatermarkMap;
     // finished spilt info
     private Map<TableId, List<CompletedSnapshotSplitInfo>> finishedSplitsInfo;
+    // offsets restored tables had already been read up to
+    private Map<TableId, Offset> tableStartupOffsets;
 
     private static final long READER_CLOSE_TIMEOUT_SECONDS = 30L;
 
@@ -97,6 +109,13 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
         configureFilter();
         taskContext.configure(currentIncrementalSplit);
         this.queue = taskContext.getQueue();
+        // Set synchronously, before the task is handed to the background thread, so there is no
+        // window in which the (single-threaded) poller can observe taskStarted=true and
+        // executing=false before the background thread has actually started running. Setting
+        // this flag from inside the submitted lambda left a gap between "taskStarted = true" and
+        // the next statement (a log call) that the poller reliably hit on every run.
+        taskStarted = true;
+        executing = true;
         executorService.submit(
                 () -> {
                     try {
@@ -112,13 +131,20 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
                                         currentIncrementalSplit),
                                 e);
                         readException = e;
+                    } finally {
+                        executing = false;
                     }
                 });
     }
 
     @Override
     public boolean isFinished() {
-        return currentIncrementalSplit == null || !streamFetchTask.isRunning();
+        // Never report finished while the background thread is still inside
+        // streamFetchTask.execute() -- streamFetchTask.isRunning() is owned by the fetch task
+        // and may not have flipped to true yet even though we are already executing it.
+        return taskStarted
+                && !executing
+                && (currentIncrementalSplit == null || !streamFetchTask.isRunning());
     }
 
     @Override
@@ -126,8 +152,11 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
             throws InterruptedException, SeaTunnelException {
         checkReadException();
 
+        // Always drain the queue first, so the last batch produced before the bounded
+        // reader stopped is not dropped. Only after the queue is drained AND the split
+        // is finished do we signal split completion by returning null.
         Iterator<SourceRecords> sourceRecordsIterator = Collections.emptyIterator();
-        if (streamFetchTask.isRunning()) {
+        if (streamFetchTask.isRunning() || isBoundedReadFinished()) {
             List<DataChangeEvent> batch = queue.poll();
             if (!batch.isEmpty()) {
                 if (schemaChangeResolver != null) {
@@ -137,12 +166,29 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
                 }
             }
         }
+
+        // If the fetch task is finished and this is a bounded read (stop.mode = "specific"),
+        // return null to signal split completion. This is important for bounded reads
+        // to properly terminate the task. For unbounded reads (stop.mode = "never"),
+        // we should never return null even if the task is not running due to errors,
+        // because that would incorrectly mark the job as FINISHED.
+        if (isBoundedReadFinished() && !sourceRecordsIterator.hasNext()) {
+            log.info("Bounded read completed, returning null to signal split completion");
+            return null;
+        }
         return sourceRecordsIterator;
+    }
+
+    private boolean isBoundedReadFinished() {
+        return isFinished()
+                && currentIncrementalSplit != null
+                && currentIncrementalSplit.getStopOffset() != null
+                && !currentIncrementalSplit.getStopOffset().isNeverStop();
     }
 
     private Iterator<SourceRecords> splitNormalStream(List<DataChangeEvent> batchEvents) {
         List<SourceRecord> sourceRecords = new ArrayList<>();
-        if (streamFetchTask.isRunning()) {
+        if (streamFetchTask.isRunning() || isBoundedReadFinished()) {
             for (DataChangeEvent event : batchEvents) {
                 if (shouldEmit(event.getRecord())) {
                     sourceRecords.add(event.getRecord());
@@ -226,7 +272,11 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
                 log.trace(
                         "The table {} is not support exactly-once, so ignore the watermark check",
                         tableId);
-                return position.isAfter(splitStartWatermark);
+                log.debug(
+                        "Non-exactly-once boundary check: position={} vs splitStartWatermark={}",
+                        position,
+                        splitStartWatermark);
+                return position.isAtOrAfter(splitStartWatermark);
             }
             // check whether the pure binlog mode has been entered
             if (hasEnterPureBinlogPhase(tableId, position)) {
@@ -234,6 +284,10 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
             }
             // not enter pure binlog mode and need to check whether the current record meets the
             // emitting conditions.
+            Offset tableStartupOffset = tableStartupOffsets.get(tableId);
+            if (tableStartupOffset != null && position.isBefore(tableStartupOffset)) {
+                return false;
+            }
             if (finishedSplitsInfo.containsKey(tableId)) {
                 for (CompletedSnapshotSplitInfo splitInfo : finishedSplitsInfo.get(tableId)) {
                     if (taskContext.isRecordBetween(
@@ -268,15 +322,10 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
         splitStartWatermark = currentIncrementalSplit.getStartupOffset();
         Map<TableId, List<CompletedSnapshotSplitInfo>> splitsInfoMap = new HashMap<>();
         Map<TableId, Offset> tableIdBinlogPositionMap = new HashMap<>();
+        Map<TableId, Offset> restoredTableOffsets =
+                currentIncrementalSplit.getTableStartupOffsets();
         List<CompletedSnapshotSplitInfo> completedSnapshotSplitInfos =
                 currentIncrementalSplit.getCompletedSnapshotSplitInfos();
-
-        // latest-offset mode
-        if (completedSnapshotSplitInfos.isEmpty()) {
-            for (TableId tableId : currentIncrementalSplit.getTableIds()) {
-                tableIdBinlogPositionMap.put(tableId, currentIncrementalSplit.getStartupOffset());
-            }
-        }
 
         // calculate the max high watermark of every table
         for (CompletedSnapshotSplitInfo finishedSplitInfo : completedSnapshotSplitInfos) {
@@ -292,8 +341,29 @@ public class IncrementalSourceStreamFetcher implements Fetcher<SourceRecords, So
                 tableIdBinlogPositionMap.put(tableId, highWatermark);
             }
         }
+
+        for (TableId tableId : currentIncrementalSplit.getTableIds()) {
+            Offset restoredOffset = restoredTableOffsets.get(tableId);
+            Offset maxHighWatermark = tableIdBinlogPositionMap.get(tableId);
+            if (maxHighWatermark == null) {
+                // The table has no snapshot split in this split: either the split starts from a
+                // log offset (latest-offset mode), or the table was already in the pure
+                // incremental phase before a restore that added other tables. Emit its changes
+                // from the offset it was already read up to. As in latest-offset mode, a record
+                // at exactly that offset is emitted: some dialects (e.g. Oracle SCN) share one
+                // offset between several records, so skipping it could lose data.
+                Offset tableStartupOffset =
+                        restoredOffset != null ? restoredOffset : splitStartWatermark;
+                if (tableStartupOffset != null) {
+                    tableIdBinlogPositionMap.put(tableId, tableStartupOffset);
+                }
+            } else if (restoredOffset != null && restoredOffset.isAfter(maxHighWatermark)) {
+                tableIdBinlogPositionMap.put(tableId, restoredOffset);
+            }
+        }
         this.finishedSplitsInfo = splitsInfoMap;
         this.maxSplitHighWatermarkMap = tableIdBinlogPositionMap;
+        this.tableStartupOffsets = restoredTableOffsets;
         this.pureBinlogPhaseTables.clear();
     }
 

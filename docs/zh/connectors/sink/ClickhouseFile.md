@@ -11,6 +11,7 @@ import ChangeLog from '../changelog/connector-clickhouse.md';
 ## 主要特性
 
 - [ ] [精准一次](../../introduction/concepts/connector-v2-features.md)
+- [ ] [timer flush](../../introduction/concepts/connector-v2-features.md)
 
 :::tip 提示
 
@@ -38,7 +39,9 @@ import ChangeLog from '../changelog/connector-clickhouse.md';
 | compatible_mode        | boolean | no   | false                                  |
 | file_fields_delimiter  | string  | no   | "\t"                                   |
 | file_temp_path         | string  | no   | "/tmp/seatunnel/clickhouse-local/file" |
-| key_path               | string  | no   | "/tmp/id_rsa"                          |
+| key_path               | string  | no   | -                                      |
+| server_time_zone       | string  | no   | ZoneId.systemDefault()                 |
+| clickhouse.config      | map     | no   | -                                      |
 | common-options         |         | no   | -                                      |
 
 ### host [string]

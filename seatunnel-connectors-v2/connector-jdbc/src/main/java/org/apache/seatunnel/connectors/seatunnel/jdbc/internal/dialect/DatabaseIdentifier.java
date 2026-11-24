@@ -28,8 +28,10 @@ public class DatabaseIdentifier {
     public static final String MYSQL = "MySQL";
     public static final String STARROCKS = "StarRocks";
     public static final String ORACLE = "Oracle";
+    public static final String YASHANDB = "YashanDB";
     public static final String PHOENIX = "Phoenix";
     public static final String POSTGRESQL = "Postgres";
+    public static final String COCKROACHDB = "CockroachDB";
     public static final String REDSHIFT = "Redshift";
     public static final String SAP_HANA = "SapHana";
     public static final String SNOWFLAKE = "Snowflake";

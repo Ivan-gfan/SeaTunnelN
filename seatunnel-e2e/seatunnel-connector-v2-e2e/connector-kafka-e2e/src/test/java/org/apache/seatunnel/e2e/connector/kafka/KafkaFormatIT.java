@@ -37,17 +37,26 @@ import org.apache.seatunnel.e2e.common.container.EngineType;
 import org.apache.seatunnel.e2e.common.container.TestContainer;
 import org.apache.seatunnel.e2e.common.junit.DisabledOnContainer;
 import org.apache.seatunnel.e2e.common.junit.TestContainerExtension;
+import org.apache.seatunnel.e2e.common.util.DependencyJar;
 
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsOptions;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.TopicDescription;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.TestTemplate;
+import org.postgresql.Driver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.Container;
@@ -76,12 +85,15 @@ import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -115,11 +127,25 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
     // ---------------------------Compatible Format Parameter---------------------------------------
     private static final String COMPATIBLE_DATA_PATH = "/compatible/compatible_data.txt";
     private static final String COMPATIBLE_KAFKA_SOURCE_TOPIC = "jdbc_source_record";
+    private static final String COMPATIBLE_TOMBSTONE_CONFIG =
+            "/compatibleFormatIT/kafkasource_jdbc_record_tombstone_to_pgsql.conf";
 
     // ---------------------------Debezium Format Parameter  ---------------------------------------
     private static final String DEBEZIUM_KAFKA_SINK_TOPIC = "test-debezium-sink";
     private static final String DEBEZIUM_DATA_PATH = "/debezium/debezium_data.txt";
     private static final String DEBEZIUM_KAFKA_SOURCE_TOPIC = "dbserver1.debezium.products";
+
+    private static final List<String> KAFKA_TOPICS =
+            Arrays.asList(
+                    CANAL_KAFKA_SOURCE_TOPIC,
+                    OGG_KAFKA_SOURCE_TOPIC,
+                    MAXWELL_KAFKA_SOURCE_TOPIC,
+                    COMPATIBLE_KAFKA_SOURCE_TOPIC,
+                    DEBEZIUM_KAFKA_SOURCE_TOPIC,
+                    CANAL_KAFKA_SINK_TOPIC,
+                    OGG_KAFKA_SINK_TOPIC,
+                    MAXWELL_KAFKA_SINK_TOPIC,
+                    DEBEZIUM_KAFKA_SINK_TOPIC);
 
     private static final String PG_SINK_TABLE1 = "sink";
     private static final String PG_SINK_TABLE2 = "sink2";
@@ -264,22 +290,13 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
     // --------------------------- Postgres Container-------------------------------------
     private static final String PG_IMAGE = "postgres:alpine3.16";
 
-    private static final String PG_DRIVER_JAR =
-            "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.3.3/postgresql-42.3.3.jar";
-
     private static PostgreSQLContainer<?> POSTGRESQL_CONTAINER;
 
     @TestContainerExtension
     private final ContainerExtendedFactory extendedFactory =
-            container -> {
-                Container.ExecResult extraCommands =
-                        container.execInContainer(
-                                "bash",
-                                "-c",
-                                "mkdir -p /tmp/seatunnel/plugins/Jdbc/lib && cd /tmp/seatunnel/plugins/Jdbc/lib && curl -O "
-                                        + PG_DRIVER_JAR);
-                Assertions.assertEquals(0, extraCommands.getExitCode());
-            };
+            container ->
+                    DependencyJar.of(Driver.class)
+                            .copyTo(container, "/tmp/seatunnel/plugins/Jdbc/lib");
 
     private void createKafkaContainer() {
         KAFKA_CONTAINER =
@@ -303,7 +320,7 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
 
     @BeforeAll
     @Override
-    public void startUp() throws ClassNotFoundException, InterruptedException, IOException {
+    public void startUp() throws ClassNotFoundException, IOException {
 
         LOG.info("The first stage: Starting Kafka containers...");
         createKafkaContainer();
@@ -327,15 +344,22 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
                 .atLeast(100, TimeUnit.MILLISECONDS)
                 .pollInterval(500, TimeUnit.MILLISECONDS)
                 .atMost(180, TimeUnit.SECONDS)
-                .untilAsserted(this::initKafkaConsumer);
+                .untilAsserted(this::initializeKafkaTopics);
 
-        // local file local data send kafka
         given().ignoreExceptions()
                 .atLeast(100, TimeUnit.MILLISECONDS)
                 .pollInterval(500, TimeUnit.MILLISECONDS)
-                .atMost(3, TimeUnit.MINUTES)
-                .untilAsserted(this::initLocalDataToKafka);
-        Thread.sleep(20 * 1000);
+                .atMost(180, TimeUnit.SECONDS)
+                .untilAsserted(this::waitForKafkaTopicsReady);
+
+        given().ignoreExceptions()
+                .atLeast(100, TimeUnit.MILLISECONDS)
+                .pollInterval(500, TimeUnit.MILLISECONDS)
+                .atMost(180, TimeUnit.SECONDS)
+                .untilAsserted(this::initKafkaConsumer);
+
+        // local file local data send kafka
+        initLocalDataToKafka();
     }
 
     @DisabledOnContainer(
@@ -423,6 +447,84 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
 
         // Check Compatible
         checkCompatibleFormat();
+    }
+
+    /**
+     * A tombstone, a record carrying a key and a {@code null} value, has to produce no row and let
+     * the source carry on past it. The guard that makes that happen sits at the top of {@code
+     * CompatibleKafkaConnectDeserializationSchema.deserialize}, before {@code convertToSinkRecord},
+     * which is the same branch the format module unit tests cover.
+     *
+     * <p>Restricted to Zeta because the committed offset assertion needs the offsets to be
+     * committed when a batch job finishes, which the other engines do not do.
+     */
+    @DisabledOnContainer(
+            value = {},
+            type = {EngineType.SPARK, EngineType.FLINK},
+            disabledReason = "flink and spark won't commit offset when batch job finished")
+    @TestTemplate
+    public void testFormatCompatibleTombstoneCheck(TestContainer container)
+            throws IOException, InterruptedException, ExecutionException {
+
+        LOG.info("======================  Check Compatible Tombstone ====================== ");
+        // The broker is shared by every test in this class, so this one publishes to its own
+        // topic under its own consumer group. Putting a tombstone on jdbc_source_record would
+        // change the fixture testFormatCompatibleCheck reads, and a shared group would carry
+        // committed offsets in from the other lanes.
+        String topic =
+                COMPATIBLE_KAFKA_SOURCE_TOPIC + "_tombstone_" + container.identifier().name();
+        createKafkaTopic(topic);
+
+        // The envelopes the compatible fixture already carries, with a tombstone inserted before
+        // the last one. Everything after the tombstone still has to arrive, so the expectation
+        // stays exactly the one testFormatCompatibleCheck asserts.
+        List<String> envelopes = readCompatibleEnvelopes();
+        try (KafkaProducer<String, String> producer =
+                new KafkaProducer<>(kafkaProducerProperties())) {
+            for (int i = 0; i < envelopes.size() - 1; i++) {
+                producer.send(new ProducerRecord<>(topic, null, envelopes.get(i))).get();
+            }
+            producer.send(new ProducerRecord<>(topic, "tombstone-key", null)).get();
+            producer.send(new ProducerRecord<>(topic, null, envelopes.get(envelopes.size() - 1)))
+                    .get();
+            producer.flush();
+        }
+        // One record per envelope, plus the tombstone.
+        long endOffset = envelopes.size() + 1L;
+
+        // Both values of format_error_handle_way. The guard returns before any format specific
+        // parsing runs, so nothing is thrown, the emitter's catch block is never entered, and
+        // the mode stops deciding what a tombstone does.
+        for (String errorHandleWay : Arrays.asList("FAIL", "SKIP")) {
+            // A group per run, so the second run has to commit an offset of its own instead of
+            // passing on the one the first run already left behind.
+            String consumerGroup = topic + "_group_" + errorHandleWay;
+            awaitGroupCoordinator(consumerGroup);
+            // Reading the sink table also truncates it, so the check below sees only the rows
+            // this run writes.
+            getPostgreSinkTableList(PG_SINK_TABLE1);
+            Container.ExecResult execCompatibleTombstoneResultToPgSql =
+                    container.executeJob(
+                            COMPATIBLE_TOMBSTONE_CONFIG,
+                            Arrays.asList(
+                                    "topic=" + topic,
+                                    "consumerGroup=" + consumerGroup,
+                                    "errorHandleWay=" + errorHandleWay));
+            Assertions.assertEquals(
+                    0,
+                    execCompatibleTombstoneResultToPgSql.getExitCode(),
+                    "format_error_handle_way="
+                            + errorHandleWay
+                            + ": "
+                            + execCompatibleTombstoneResultToPgSql.getStderr());
+
+            // The tombstone produced no row and every real record still arrived.
+            checkCompatibleFormat();
+
+            // And the offset moved past the tombstone, so a restart does not replay it. A row
+            // count on its own would not catch that, which is why this assertion is here.
+            assertCommittedOffsetReached(topic, consumerGroup, endOffset, errorHandleWay);
+        }
     }
 
     @TestTemplate
@@ -870,6 +972,117 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
         Assertions.assertIterableEquals(expected, actual);
     }
 
+    /**
+     * Reads the envelopes the compatible format fixture already carries, so the tombstone test
+     * publishes the same payload shape and can reuse {@link #checkCompatibleFormat()} as its
+     * expectation.
+     */
+    private List<String> readCompatibleEnvelopes() throws IOException {
+        InputStream inputStream = KafkaFormatIT.class.getResourceAsStream(COMPATIBLE_DATA_PATH);
+        Assertions.assertNotNull(inputStream, "missing fixture " + COMPATIBLE_DATA_PATH);
+        List<String> envelopes = new ArrayList<>();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                envelopes.add(line);
+            }
+        }
+        Assertions.assertTrue(
+                envelopes.size() > 1,
+                "the compatible fixture needs at least two records to place a tombstone between");
+        return envelopes;
+    }
+
+    private void createKafkaTopic(String topicName) {
+        try (AdminClient adminClient = createKafkaAdmin()) {
+            Set<String> existingTopics = adminClient.listTopics().names().get(30, TimeUnit.SECONDS);
+            if (existingTopics.contains(topicName)) {
+                return;
+            }
+            adminClient
+                    .createTopics(Arrays.asList(new NewTopic(topicName, 1, (short) 1)))
+                    .all()
+                    .get(60, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while creating Kafka topic " + topicName, e);
+        } catch (ExecutionException | TimeoutException e) {
+            throw new RuntimeException("Failed to create Kafka topic " + topicName, e);
+        }
+    }
+
+    /**
+     * Waits until the broker can coordinate the consumer group. A new group that commits first in a
+     * fresh broker races the creation of {@code __consumer_offsets}: the commit fails with {@code
+     * CoordinatorNotAvailableException} and the source only logs it. The admin client retries the
+     * coordinator lookup itself, and this commits nothing for the group.
+     */
+    private void awaitGroupCoordinator(String consumerGroup) {
+        try (AdminClient adminClient = createKafkaAdmin()) {
+            adminClient
+                    .describeConsumerGroups(Arrays.asList(consumerGroup))
+                    .all()
+                    .get(60, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(
+                    "Interrupted while waiting for the coordinator of " + consumerGroup, e);
+        } catch (ExecutionException | TimeoutException e) {
+            throw new RuntimeException("No coordinator for consumer group " + consumerGroup, e);
+        }
+    }
+
+    /**
+     * Asserts the consumer group committed an offset past the tombstone. The source commits from
+     * {@code notifyCheckpointComplete}, which runs once the job has already reported success, so
+     * this polls instead of reading the offset once.
+     */
+    private void assertCommittedOffsetReached(
+            String topic, String consumerGroup, long expectedOffset, String errorHandleWay) {
+        TopicPartition topicPartition = new TopicPartition(topic, 0);
+        ListConsumerGroupOffsetsOptions options =
+                new ListConsumerGroupOffsetsOptions()
+                        .topicPartitions(Arrays.asList(topicPartition));
+        try (AdminClient adminClient = createKafkaAdmin()) {
+            await().atMost(60, TimeUnit.SECONDS)
+                    .pollInterval(1, TimeUnit.SECONDS)
+                    .untilAsserted(
+                            () -> {
+                                Map<TopicPartition, OffsetAndMetadata> committed =
+                                        adminClient
+                                                .listConsumerGroupOffsets(consumerGroup, options)
+                                                .partitionsToOffsetAndMetadata()
+                                                .get(30, TimeUnit.SECONDS);
+                                OffsetAndMetadata offsetAndMetadata = committed.get(topicPartition);
+                                Assertions.assertNotNull(
+                                        offsetAndMetadata,
+                                        "format_error_handle_way="
+                                                + errorHandleWay
+                                                + ": no committed offset for "
+                                                + topicPartition);
+                                Assertions.assertEquals(
+                                        expectedOffset,
+                                        offsetAndMetadata.offset(),
+                                        "format_error_handle_way="
+                                                + errorHandleWay
+                                                + ": the committed offset must sit past the"
+                                                + " tombstone");
+                            });
+        }
+    }
+
+    private Properties kafkaProducerProperties() {
+        Properties props = new Properties();
+        props.put("bootstrap.servers", KAFKA_CONTAINER.getBootstrapServers());
+        props.put("acks", "all");
+        props.put("retries", 0);
+        props.put("linger.ms", 1);
+        props.put("buffer.memory", 33554432);
+        props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        return props;
+    }
+
     // Initialize the kafka Consumer
     private void initKafkaConsumer() {
         Properties prop = new Properties();
@@ -885,6 +1098,56 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
         prop.put(ConsumerConfig.GROUP_ID_CONFIG, "CONF");
         prop.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
         kafkaConsumer = new KafkaConsumer<>(prop);
+    }
+
+    private void initializeKafkaTopics() {
+        try (AdminClient adminClient = createKafkaAdmin()) {
+            Set<String> existingTopics = adminClient.listTopics().names().get(30, TimeUnit.SECONDS);
+            List<NewTopic> topicsToCreate =
+                    KAFKA_TOPICS.stream()
+                            .filter(topic -> !existingTopics.contains(topic))
+                            .map(topic -> new NewTopic(topic, 1, (short) 1))
+                            .collect(Collectors.toList());
+            if (!topicsToCreate.isEmpty()) {
+                adminClient.createTopics(topicsToCreate).all().get(60, TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while initializing Kafka topics", e);
+        } catch (ExecutionException | java.util.concurrent.TimeoutException e) {
+            throw new RuntimeException("Failed to initialize Kafka topics", e);
+        }
+    }
+
+    private void waitForKafkaTopicsReady() {
+        try (AdminClient adminClient = createKafkaAdmin()) {
+            Map<String, TopicDescription> topicDescriptions =
+                    adminClient
+                            .describeTopics(KAFKA_TOPICS)
+                            .allTopicNames()
+                            .get(30, TimeUnit.SECONDS);
+            Assertions.assertEquals(
+                    new HashSet<>(KAFKA_TOPICS).size(),
+                    topicDescriptions.size(),
+                    "Kafka topics are not ready yet");
+            KAFKA_TOPICS.forEach(
+                    topic ->
+                            Assertions.assertTrue(
+                                    topicDescriptions.containsKey(topic),
+                                    "Kafka topic is not ready yet: " + topic));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for Kafka topics", e);
+        } catch (ExecutionException | java.util.concurrent.TimeoutException e) {
+            throw new RuntimeException("Kafka topics are not ready yet", e);
+        }
+    }
+
+    private AdminClient createKafkaAdmin() {
+        Properties props = new Properties();
+        props.put(
+                AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA_CONTAINER.getBootstrapServers());
+        return AdminClient.create(props);
     }
 
     // Example Initialize the pg sink table
@@ -957,18 +1220,7 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
 
     // Initialize ogg data to kafka
     private void initLocalDataToKafka() {
-        String bootstrapServers = KAFKA_CONTAINER.getBootstrapServers();
-        Properties props = new Properties();
-
-        props.put("bootstrap.servers", bootstrapServers);
-        props.put("acks", "all");
-        props.put("retries", 0);
-        props.put("linger.ms", 1);
-        props.put("buffer.memory", 33554432);
-        props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
-        props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
-
-        KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+        KafkaProducer<String, String> producer = new KafkaProducer<>(kafkaProducerProperties());
         for (String localPath : LOCAL_DATA_TO_KAFKA_MAPPING.keySet()) {
             String kafkaTopic = LOCAL_DATA_TO_KAFKA_MAPPING.get(localPath);
             InputStream inputStream = KafkaFormatIT.class.getResourceAsStream(localPath);
@@ -981,7 +1233,11 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
                         producer.send(record).get();
                     }
                 } catch (IOException | InterruptedException | ExecutionException e) {
-                    e.printStackTrace();
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                    throw new RuntimeException(
+                            "Failed to initialize local Kafka data for topic " + kafkaTopic, e);
                 }
             }
         }
@@ -1013,7 +1269,7 @@ public class KafkaFormatIT extends TestSuiteBase implements TestResource {
                 LOG.info("truncate table sink");
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            throw new RuntimeException("Query Postgre sink table failed: " + tableName, e);
         }
         return actual;
     }

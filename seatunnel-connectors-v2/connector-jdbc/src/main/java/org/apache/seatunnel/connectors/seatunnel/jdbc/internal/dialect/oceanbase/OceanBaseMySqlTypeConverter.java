@@ -35,6 +35,8 @@ import org.apache.seatunnel.connectors.seatunnel.jdbc.internal.dialect.DatabaseI
 import com.google.auto.service.AutoService;
 import lombok.extern.slf4j.Slf4j;
 
+import java.util.Locale;
+
 @Slf4j
 @AutoService(TypeConverter.class)
 public class OceanBaseMySqlTypeConverter
@@ -121,7 +123,7 @@ public class OceanBaseMySqlTypeConverter
                         .defaultValue(typeDefine.getDefaultValue())
                         .comment(typeDefine.getComment());
 
-        String mysqlDataType = typeDefine.getDataType().toUpperCase();
+        String mysqlDataType = typeDefine.getDataType().toUpperCase(Locale.ROOT);
         if (typeDefine.isUnsigned() && !(mysqlDataType.endsWith(" UNSIGNED"))) {
             mysqlDataType = mysqlDataType + " UNSIGNED";
         }
@@ -291,12 +293,15 @@ public class OceanBaseMySqlTypeConverter
                 builder.scale(typeDefine.getScale());
                 break;
             case MYSQL_DATETIME:
-            case MYSQL_TIMESTAMP:
                 builder.dataType(LocalTimeType.LOCAL_DATE_TIME_TYPE);
                 builder.scale(typeDefine.getScale());
                 break;
+            case MYSQL_TIMESTAMP:
+                builder.dataType(LocalTimeType.OFFSET_DATE_TIME_TYPE);
+                builder.scale(typeDefine.getScale());
+                break;
             case VECTOR_NAME:
-                String columnType = typeDefine.getColumnType().toUpperCase();
+                String columnType = typeDefine.getColumnType().toUpperCase(Locale.ROOT);
                 if (columnType.startsWith("VECTOR(") && columnType.endsWith(")")) {
                     Integer number =
                             Integer.parseInt(
@@ -516,6 +521,28 @@ public class OceanBaseMySqlTypeConverter
                     builder.scale(timestampScale);
                 } else {
                     builder.columnType(MYSQL_DATETIME);
+                }
+                break;
+            case TIMESTAMP_TZ:
+                builder.nativeType(OceanBaseMysqlType.TIMESTAMP);
+                builder.dataType(MYSQL_TIMESTAMP);
+                if (column.getScale() != null && column.getScale() > 0) {
+                    int timestampTzScale = column.getScale();
+                    if (timestampTzScale > MAX_TIMESTAMP_SCALE) {
+                        timestampTzScale = MAX_TIMESTAMP_SCALE;
+                        log.warn(
+                                "The timestamp_tz column {} type timestamp({}) is out of range, "
+                                        + "which exceeds the maximum scale of {}, "
+                                        + "it will be converted to timestamp({})",
+                                column.getName(),
+                                column.getScale(),
+                                MAX_TIMESTAMP_SCALE,
+                                timestampTzScale);
+                    }
+                    builder.columnType(String.format("%s(%s)", MYSQL_TIMESTAMP, timestampTzScale));
+                    builder.scale(timestampTzScale);
+                } else {
+                    builder.columnType(MYSQL_TIMESTAMP);
                 }
                 break;
             case FLOAT_VECTOR:

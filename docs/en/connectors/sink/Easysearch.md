@@ -10,16 +10,18 @@ import ChangeLog from '../changelog/connector-easysearch.md';
 
 ## Description
 
-A sink plugin which use send data to `INFINI Easysearch`.
+A sink plugin used to send data to `INFINI Easysearch`.
 
 ## Using Dependency
 
-> Depenndency [easysearch-client](https://central.sonatype.com/artifact/com.infinilabs/easysearch-client)
->
-  ## Key features
+> Dependency [easysearch-client](https://central.sonatype.com/artifact/com.infinilabs/easysearch-client)
+
+## Key features
 
 - [ ] [exactly-once](../../introduction/concepts/connector-v2-features.md)
 - [x] [cdc](../../introduction/concepts/connector-v2-features.md)
+- [x] [batch](../../introduction/concepts/connector-v2-features.md)
+- [ ] [support multiple table write](../../introduction/concepts/connector-v2-features.md)
 
 :::tip
 
@@ -41,29 +43,30 @@ Engine Supported
 | LONG                        | LONG                 |
 | FLOAT<br/>HALF_FLOAT        | FLOAT                |
 | DOUBLE                      | DOUBLE               |
-| Date                        | LOCAL_DATE_TIME_TYPE |
+| DATE                        | LOCAL_DATE_TIME_TYPE |
 
 ## Sink Options
 
-|          name           |  type   | required | default value |
-|-------------------------|---------|----------|---------------|
-| hosts                   | array   | yes      | -             |
-| index                   | string  | yes      | -             |
-| primary_keys            | list    | no       |               |
-| key_delimiter           | string  | no       | `_`           |
-| username                | string  | no       |               |
-| password                | string  | no       |               |
-| max_retry_count         | int     | no       | 3             |
-| max_batch_size          | int     | no       | 10            |
-| tls_verify_certificate  | boolean | no       | true          |
-| tls_verify_hostnames    | boolean | no       | true          |
-| tls_keystore_path       | string  | no       | -             |
-| tls_keystore_password   | string  | no       | -             |
-| tls_truststore_path     | string  | no       | -             |
-| tls_truststore_password | string  | no       | -             |
-| schema_save_mode        | enum    | no       | CREATE_SCHEMA_WHEN_NOT_EXIST |
-| data_save_mode          | enum    | no       | APPEND_DATA   |
-| common-options          |         | no       | -             |
+|          name          |  type   | required | default value | description                                                                                                       |
+|------------------------|---------|----------|---------------|-------------------------------------------------------------------------------------------------------------------|
+| hosts                  | array   | yes      | -             | Easysearch HTTP cluster addresses in `host:port` format, for example `["host1:9200", "host2:9200"]`.              |
+| index                  | string  | yes      | -             | Easysearch index name. Supports placeholders such as `seatunnel_${age}`.                                          |
+| primary_keys           | list    | no       | -             | Primary key fields used to build the document `_id`. Configure when writing CDC rows that need upsert/delete.      |
+| key_delimiter          | string  | no       | `_`           | Delimiter used to join composite key fields when building `_id`.                                                 |
+| key_encoding | enum | no | LEGACY | Encoding used to build document keys; see `key_encoding` below. |
+| username               | string  | no       | -             | Username for secured Easysearch clusters.                                                                        |
+| password               | string  | no       | -             | Password for secured Easysearch clusters.                                                                        |
+| max_retry_count        | int     | no       | 3             | Maximum retry count for one bulk request.                                                                        |
+| max_batch_size         | int     | no       | 10            | Maximum number of documents buffered into one bulk request.                                                      |
+| tls_verify_certificate | boolean | no       | true          | Whether to validate HTTPS certificates.                                                                          |
+| tls_verify_hostname    | boolean | no       | true          | Whether to validate HTTPS host names.                                                                            |
+| tls_keystore_path      | string  | no       | -             | Path to the PEM or JKS key store.                                                                                |
+| tls_keystore_password  | string  | no       | -             | Password for the configured key store.                                                                           |
+| tls_truststore_path    | string  | no       | -             | Path to the PEM or JKS trust store.                                                                              |
+| tls_truststore_password | string | no       | -             | Password for the configured trust store.                                                                         |
+| schema_save_mode       | enum    | no       | CREATE_SCHEMA_WHEN_NOT_EXIST | How to handle the target index before the synchronization task starts. See `schema_save_mode` below. |
+| data_save_mode         | enum    | no       | APPEND_DATA   | How to handle existing target data before the synchronization task starts. See `data_save_mode` below.           |
+| common-options         |         | no       | -             | Sink plugin common parameters, please refer to [Sink Common Options](../common-options/sink-common-options.md).   |
 
 ### hosts [array]
 
@@ -71,16 +74,21 @@ Engine Supported
 
 ### index [string]
 
-`INFINI Easysearch`  `index` name.Index support contains variables of field name,such as `seatunnel_${age}`,and the field must appear at seatunnel row.
-If not, we will treat it as a normal index.
+`INFINI Easysearch` index name. The index can contain field placeholders, such as `seatunnel_${age}`. The referenced field must exist in the input row; otherwise the value is treated as a normal literal index name.
 
 ### primary_keys [list]
 
-Primary key fields used to generate the document `_id`, this is cdc required options.
+Primary key fields used to generate the document `_id`. Configure this option when writing CDC rows that need update or delete semantics.
 
 ### key_delimiter [string]
 
 Delimiter for composite keys ("_" by default), e.g., "$" would result in document `_id` "KEY1$KEY2$KEY3".
+
+### key_encoding [enum]
+
+`LEGACY` (default) keeps existing document IDs. With multiple `primary_keys`, values containing `key_delimiter` can produce the same ID. Set `LENGTH_PREFIXED` to encode each formatted value as `<length>:<value>`; for example, `["1_1", "2"]` becomes `3:1_11:2` and `["1", "1_2"]` becomes `1:13:1_2`. This mode ignores `key_delimiter` and leaves single-key IDs unchanged.
+
+Changing this option for an existing composite-key index changes its document IDs. Reindex or migrate existing documents before switching; otherwise subsequent writes can create duplicates instead of updating the old IDs.
 
 ### username [string]
 
@@ -92,11 +100,11 @@ security password
 
 ### max_retry_count [int]
 
-one bulk request max try size
+Maximum retry count for one bulk request.
 
 ### max_batch_size [int]
 
-batch bulk doc max size
+Maximum number of documents buffered in one bulk request.
 
 ### tls_verify_certificate [boolean]
 
@@ -139,32 +147,85 @@ Choose how to handle the target-side data before starting the synchronization ta
 
 ### common options
 
-Sink plugin common parameters, please refer to [Sink Common Options](../common-options/sink-common-options.md) for details
+Sink plugin common parameters, please refer to [Sink Common Options](../common-options/sink-common-options.md) for details.
 
 ## Examples
 
-Simple
+### Write To One Index
 
-```bash
+```hocon
 sink {
-    Easysearch {
-        hosts = ["localhost:9200"]
-        index = "seatunnel-${age}"
-    }
+  Easysearch {
+    hosts = ["localhost:9200"]
+    index = "seatunnel_index"
+    max_batch_size = 100
+  }
 }
 ```
 
-CDC(Change data capture) event
+### Write To Dynamic Index
 
-```bash
+```hocon
 sink {
-    Easysearch {
-        hosts = ["localhost:9200"]
-        index = "seatunnel-${age}"
+  Easysearch {
+    hosts = ["localhost:9200"]
+    index = "seatunnel_${age}"
+  }
+}
+```
 
-        # cdc required options
-        primary_keys = ["key1", "key2", ...]
+### CDC Event
+
+```hocon
+sink {
+  Easysearch {
+    hosts = ["localhost:9200"]
+    index = "seatunnel_${age}"
+    primary_keys = ["key1", "key2"]
+  }
+}
+```
+
+### Route Rows To Dynamic Indexes
+
+Easysearch does not implement the multi-table sink contract. This example uses one
+input table with a `target_index` field on each row. The index template reads that
+field and writes the two rows to `st_customers` and `st_orders`. Upstream table
+identifiers are not automatically exposed as row fields. `target_index` is a
+row field; the reserved `${table_name}` metadata placeholder is not used here.
+Create the target indexes first or enable index auto-creation on the server.
+`schema_save_mode = "IGNORE"` leaves their schema management to the server.
+
+```hocon
+env {
+  parallelism = 1
+  job.mode = "BATCH"
+}
+
+source {
+  FakeSource {
+    row.num = 2
+    schema {
+      fields {
+        id = int
+        name = string
+        target_index = string
+      }
     }
+    rows = [
+      { kind = INSERT, fields = [1, "alice", "customers"] },
+      { kind = INSERT, fields = [2, "order", "orders"] }
+    ]
+  }
+}
+
+sink {
+  Easysearch {
+    hosts = ["localhost:9200"]
+    index = "st_${target_index}"
+    primary_keys = ["id"]
+    schema_save_mode = "IGNORE"
+  }
 }
 ```
 
@@ -211,7 +272,7 @@ sink {
 }
 ```
 
-SAVE_MODE
+### Save Mode
 
 ```hocon
 sink {
@@ -220,6 +281,7 @@ sink {
         username = "admin"
         password = "admin"
 
+        index = "seatunnel_index"
         schema_save_mode = "CREATE_SCHEMA_WHEN_NOT_EXIST"
         data_save_mode = "APPEND_DATA"
     }
@@ -229,4 +291,3 @@ sink {
 ## Changelog
 
 <ChangeLog />
-

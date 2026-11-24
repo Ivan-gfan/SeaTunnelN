@@ -24,8 +24,12 @@ import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.e2e.common.TestResource;
 import org.apache.seatunnel.e2e.common.TestSuiteBase;
 import org.apache.seatunnel.e2e.common.container.ContainerExtendedFactory;
+import org.apache.seatunnel.e2e.common.container.EngineType;
 import org.apache.seatunnel.e2e.common.container.TestContainer;
+import org.apache.seatunnel.e2e.common.junit.DisabledOnContainer;
 import org.apache.seatunnel.e2e.common.junit.TestContainerExtension;
+import org.apache.seatunnel.e2e.common.util.DependencyJar;
+import org.apache.seatunnel.e2e.common.util.JobIdGenerator;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
@@ -55,8 +59,12 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -76,6 +84,10 @@ public class JdbcMysqlMultipleTablesIT extends TestSuiteBase implements TestReso
             TABLES.stream()
                     .map(table -> SOURCE_DATABASE + "." + table)
                     .collect(Collectors.toList());
+
+    private static final List<String> MANUAL_COMMIT_TABLES =
+            Arrays.asList("manual_commit_table1", "manual_commit_table2");
+    private static final int MANUAL_COMMIT_ROWS_PER_TABLE = 100;
 
     private static final List<String> SINK_TABLES =
             TABLES.stream().map(table -> SINK_DATABASE + "." + table).collect(Collectors.toList());
@@ -133,15 +145,9 @@ public class JdbcMysqlMultipleTablesIT extends TestSuiteBase implements TestReso
 
     @TestContainerExtension
     protected final ContainerExtendedFactory extendedFactory =
-            container -> {
-                Container.ExecResult extraCommands =
-                        container.execInContainer(
-                                "bash",
-                                "-c",
-                                "mkdir -p /tmp/seatunnel/plugins/Jdbc/lib && cd /tmp/seatunnel/plugins/Jdbc/lib && wget "
-                                        + "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.0.32/mysql-connector-j-8.0.32.jar");
-                Assertions.assertEquals(0, extraCommands.getExitCode(), extraCommands.getStderr());
-            };
+            container ->
+                    DependencyJar.ofClassName("com.mysql.cj.jdbc.Driver")
+                            .copyTo(container, "/tmp/seatunnel/plugins/Jdbc/lib");
 
     @BeforeAll
     @Override
@@ -234,6 +240,97 @@ public class JdbcMysqlMultipleTablesIT extends TestSuiteBase implements TestReso
         Assertions.assertAll(asserts);
     }
 
+    @TestTemplate
+    public void testMysqlJdbcContinueOtherTablesWhenSinkSchemaMissing(TestContainer container)
+            throws IOException, InterruptedException, SQLException {
+        clearSinkTables();
+        dropTable(SINK_DATABASE, "table2");
+
+        try {
+            Container.ExecResult execResult =
+                    container.executeJob(
+                            "/jdbc_mysql_source_and_sink_with_missing_sink_table_continue_other_tables.conf");
+
+            String errorOutput =
+                    String.valueOf(execResult.getStderr())
+                            + String.valueOf(execResult.getStdout())
+                            + container.getServerLogs();
+            Assertions.assertTrue(
+                    errorOutput.contains("sink.table2") || errorOutput.contains("table2"),
+                    "job output should contain the failed sink table, but was: " + errorOutput);
+            Assertions.assertTrue(
+                    errorOutput.contains("phase=save_mode")
+                            || errorOutput.contains("save_mode")
+                            || errorOutput.contains("The sink table not exist"),
+                    "job output should contain the save-mode failure detail, but was: "
+                            + errorOutput);
+
+            Assertions.assertIterableEquals(
+                    query(String.format("SELECT * FROM %s.%s", SOURCE_DATABASE, "table1")),
+                    query(String.format("SELECT * FROM %s.%s", SINK_DATABASE, "table1")));
+        } finally {
+            createTables(SINK_DATABASE, Arrays.asList("table2"));
+            clearSinkTables();
+        }
+    }
+
+    /**
+     * Healthy path for the shared manual-commit transaction state (#12624). Both tables of the
+     * multi-table sink land on one queue, so they share one pooled connection and one open
+     * transaction. With {@code auto_commit = false}, batch-size flushes stay uncommitted until the
+     * next checkpoint, and the slowed-down source makes several checkpoints happen while both
+     * tables have pending batches. Every row must arrive and the sink must never report lost
+     * batches, so the state cannot fail a healthy job.
+     */
+    @TestTemplate
+    @DisabledOnContainer(
+            value = {},
+            type = {EngineType.SPARK, EngineType.FLINK},
+            disabledReason = "The shared multi-table queue connection is a Zeta engine path")
+    public void testMysqlMultipleTablesManualCommitAcrossCheckpoints(TestContainer container)
+            throws IOException, InterruptedException {
+        String jobId = String.valueOf(JobIdGenerator.newJobId());
+        Container.ExecResult execResult =
+                container.executeJob("/jdbc_mysql_fake_multiple_tables_manual_commit.conf", jobId);
+        Assertions.assertEquals(0, execResult.getExitCode(), execResult.getStderr());
+
+        String serverLogs = container.getServerLogs();
+        Matcher completedCheckpoint =
+                Pattern.compile(
+                                "pending checkpoint notify finished, job id: "
+                                        + Pattern.quote(jobId)
+                                        + ", pipeline id: \\d+, checkpoint id: (\\d+)!")
+                        .matcher(serverLogs);
+        Set<String> completedCheckpointIds = new HashSet<>();
+        while (completedCheckpoint.find()) {
+            String checkpointId = completedCheckpoint.group(1);
+            // The batch job's terminal checkpoint uses PREPARE_CLOSE_BARRIER_ID (Long.MAX_VALUE).
+            if (!String.valueOf(Long.MAX_VALUE).equals(checkpointId)) {
+                completedCheckpointIds.add(checkpointId);
+            }
+        }
+        Assertions.assertTrue(
+                completedCheckpointIds.size() >= 2,
+                "expected at least two completed non-terminal checkpoints for job "
+                        + jobId
+                        + ", but observed "
+                        + completedCheckpointIds);
+
+        String expected = String.valueOf(MANUAL_COMMIT_ROWS_PER_TABLE);
+        for (String table : MANUAL_COMMIT_TABLES) {
+            Assertions.assertEquals(
+                    Arrays.asList(Arrays.asList(expected, expected)),
+                    query(
+                            String.format(
+                                    "SELECT COUNT(*), COUNT(DISTINCT id) FROM %s.%s",
+                                    SINK_DATABASE, table)),
+                    "rows in " + SINK_DATABASE + "." + table);
+        }
+        Assertions.assertFalse(
+                serverLogs.contains("Flushed but uncommitted JDBC batches"),
+                "a healthy job must not report lost batches");
+    }
+
     @AfterAll
     @Override
     public void tearDown() throws Exception {
@@ -324,6 +421,12 @@ public class JdbcMysqlMultipleTablesIT extends TestSuiteBase implements TestReso
             try (Statement statement = connection.createStatement()) {
                 statement.execute(sql);
             }
+        }
+    }
+
+    private void dropTable(String database, String table) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(String.format("drop table if exists %s.%s", database, table));
         }
     }
 

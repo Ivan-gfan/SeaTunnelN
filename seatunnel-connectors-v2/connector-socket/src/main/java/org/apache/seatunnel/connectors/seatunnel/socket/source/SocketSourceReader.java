@@ -38,6 +38,7 @@ public class SocketSourceReader extends AbstractSingleSplitReader<SeaTunnelRow> 
     private final SocketConfig parameter;
     private final SingleSplitReaderContext context;
     private Socket socket;
+    private BufferedReader reader;
     private final String delimiter = "\n";
 
     SocketSourceReader(SocketConfig parameter, SingleSplitReaderContext context) {
@@ -52,42 +53,62 @@ public class SocketSourceReader extends AbstractSingleSplitReader<SeaTunnelRow> 
                 "connect socket server, host:[{}], port:[{}] ",
                 this.parameter.getHost(),
                 this.parameter.getPort());
-        socket.connect(
-                new InetSocketAddress(this.parameter.getHost(), this.parameter.getPort()), 0);
+        try {
+            // Bounded connect: an unreachable or filtered host would otherwise block the reader
+            // thread indefinitely with no way to observe a failure.
+            socket.connect(
+                    new InetSocketAddress(this.parameter.getHost(), this.parameter.getPort()),
+                    this.parameter.getConnectTimeoutMs());
+            // 0 keeps the historical blocking-read behaviour, which long-lived socket sources rely
+            // on.
+            socket.setSoTimeout(this.parameter.getReadTimeoutMs());
+            reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+        } catch (Exception e) {
+            // Do not leave an unconnected socket behind when open() fails.
+            try {
+                socket.close();
+            } catch (Exception closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
+        }
     }
 
     @Override
     public void close() throws IOException {
-        if (socket != null) {
-            socket.close();
+        try {
+            if (reader != null) {
+                reader.close();
+            }
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
         }
     }
 
     @Override
     public void pollNext(Collector<SeaTunnelRow> output) throws Exception {
         StringBuilder buffer = new StringBuilder();
-        try (BufferedReader reader =
-                new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
-            char[] buf = new char[CHAR_BUFFER_SIZE];
-            int bytesRead;
-            while ((bytesRead = reader.read(buf)) != -1) {
-                buffer.append(buf, 0, bytesRead);
+        char[] buf = new char[CHAR_BUFFER_SIZE];
+        int bytesRead;
+        while ((bytesRead = reader.read(buf)) != -1) {
+            buffer.append(buf, 0, bytesRead);
 
-                int delimPos;
-                while (buffer.length() >= this.delimiter.length()
-                        && (delimPos = buffer.indexOf(this.delimiter)) != -1) {
-                    String record = buffer.substring(0, delimPos);
-                    if (record.endsWith("\r")) {
-                        record = record.substring(0, record.length() - 1);
-                    }
-                    output.collect(new SeaTunnelRow(new Object[] {record}));
-                    buffer.delete(0, delimPos + this.delimiter.length());
+            int delimPos;
+            while (buffer.length() >= this.delimiter.length()
+                    && (delimPos = buffer.indexOf(this.delimiter)) != -1) {
+                String record = buffer.substring(0, delimPos);
+                if (record.endsWith("\r")) {
+                    record = record.substring(0, record.length() - 1);
                 }
-                if (Boundedness.BOUNDED.equals(context.getBoundedness())) {
-                    // signal to the source that we have reached the end of the data.
-                    context.signalNoMoreElement();
-                    break;
-                }
+                output.collect(new SeaTunnelRow(new Object[] {record}));
+                buffer.delete(0, delimPos + this.delimiter.length());
+            }
+            if (Boundedness.BOUNDED.equals(context.getBoundedness())) {
+                // signal to the source that we have reached the end of the data.
+                context.signalNoMoreElement();
+                break;
             }
         }
         if (buffer.length() > 0) {

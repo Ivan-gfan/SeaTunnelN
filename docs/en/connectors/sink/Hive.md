@@ -4,15 +4,21 @@ import ChangeLog from '../changelog/connector-hive.md';
 
 > Hive sink connector
 
+## Support Those Engines
+
+> Spark<br/>
+> Flink<br/>
+> SeaTunnel Zeta<br/>
+
 ## Description
 
-Write data to Hive.
+Write data to Apache Hive tables. The connector uses Hive Metastore for table management and writes data files (text, parquet, ORC) to HDFS (or S3/OSS when configured). The file format is detected from the Hive table's storage format (`STORED AS`) and cannot be configured on the connector. By default it uses two-phase commit so each checkpoint either commits the whole batch or rolls it back.
 
 :::tip
 
 In order to use this connector, You must ensure your spark/flink cluster already integrated hive. The tested hive version is 2.3.9 and 3.1.3 .
 
-If you use SeaTunnel Engine, You need put seatunnel-hadoop3-3.1.4-uber.jar and hive-exec-3.1.3.jar and libfb303-0.9.3.jar in $SEATUNNEL_HOME/lib/ dir.
+If you use SeaTunnel Engine, use the `seatunnel-shade-hadoop3-uber-*.jar` bundled in `$SEATUNNEL_HOME/lib/`. Add `hive-exec-3.1.3.jar` and `libfb303-0.9.3.jar` to the same directory.
 :::
 
 ## Key features
@@ -22,37 +28,57 @@ If you use SeaTunnel Engine, You need put seatunnel-hadoop3-3.1.4-uber.jar and h
 
 By default, we use 2PC commit to ensure `exactly-once`
 
-- [x] file format
+- [x] file format (detected from the Hive table's `STORED AS` clause)
   - [x] text
-  - [x] csv
   - [x] parquet
   - [x] orc
-  - [x] json
 - [x] compress codec
   - [x] lzo
 
 ## Options
 
-| name                                  | type    | required | default value  |
-|---------------------------------------|---------|----------|----------------|
-| table_name                            | string  | yes      | -              |
-| metastore_uri                         | string  | yes      | -              |
-| compress_codec                        | string  | no       | none           |
-| hdfs_site_path                        | string  | no       | -              |
-| hive_site_path                        | string  | no       | -              |
-| hive.hadoop.conf                      | Map     | no       | -              |
-| hive.hadoop.conf-path                 | string  | no       | -              |
-| krb5_path                             | string  | no       | /etc/krb5.conf |
-| kerberos_principal                    | string  | no       | -              |
-| kerberos_keytab_path                  | string  | no       | -              |
-| abort_drop_partition_metadata         | boolean | no       | true           |
-| parquet_avro_write_timestamp_as_int96 | boolean | no       | false          |
-| overwrite                             | boolean | no       | false          |
-| data_save_mode                        | enum    | no       | APPEND_DATA    |
+| name                                  | type    | required | default value  | description |
+|---------------------------------------|---------|----------|----------------|-------------|
+| table_name                            | string  | yes      | -              | Target Hive table name, e.g. `db1.table1`. For multi-table mode, you can use `${database_name}.${table_name}` and SeaTunnel will substitute the upstream values. |
+| metastore_uri                         | string  | no       | -              | Hive metastore URI. Required unless `hive.metastore.client.factory.class` is configured through `hive_site_path`, `hive.hadoop.conf-path`, or `hive.hadoop.conf`. Comma-separated values enable HA failover. |
+| compress_codec                        | string  | no       | none           | Explicit output compression codec. ORC supports `NONE`, `SNAPPY`, `ZLIB`, `LZ4` and `LZO`. Defaults to `none`; see `use_table_compression` to inherit compression from an existing ORC table. |
+| use_table_compression                 | boolean | no       | false          | Inherit `orc.compress` from an existing ORC table when no explicit codec is configured. |
+| hdfs_site_path                        | string  | no       | -              | Local path of `hdfs-site.xml`. Deprecated for new jobs — prefer `hive.hadoop.conf` or `hive.hadoop.conf-path`. |
+| hive_site_path                        | string  | no       | -              | Local path of `hive-site.xml`. |
+| hive.hadoop.conf                      | Map     | no       | -              | Inline Hadoop configuration properties. |
+| hive.hadoop.conf-path                 | string  | no       | -              | Directory that contains `core-site.xml`, `hdfs-site.xml`, and `hive-site.xml`. |
+| remote_user                           | string  | no       | -              | Hadoop remote user name used when connecting without Kerberos. |
+| krb5_path                             | string  | no       | /etc/krb5.conf | Path to `krb5.conf` for Kerberos authentication. |
+| kerberos_principal                    | string  | no       | -              | Principal for Kerberos authentication. |
+| kerberos_keytab_path                  | string  | no       | -              | Path to the keytab file paired with `kerberos_principal`. |
+| abort_drop_partition_metadata         | boolean | no       | false          | If true, drop partition metadata from Hive Metastore on abort. The data files in the partition are still removed. |
+| parquet_avro_write_timestamp_as_int96 | boolean | no       | false          | Write Parquet `INT96` from a timestamp. Only valid for parquet output. |
+| overwrite                             | boolean | no       | false          | Replace existing data before commit. Equivalent to `data_save_mode = "DROP_DATA"`. |
+| data_save_mode                        | enum    | no       | APPEND_DATA    | How to handle existing data before writing. `APPEND_DATA` (default), `DROP_DATA`, `CUSTOM_PROCESSING`, `ERROR_WHEN_DATA_EXISTS`. |
+| schema_save_mode                      | enum    | no       | CREATE_SCHEMA_WHEN_NOT_EXIST | How to handle the target table schema before writing. `RECREATE_SCHEMA`, `CREATE_SCHEMA_WHEN_NOT_EXIST`, `ERROR_WHEN_SCHEMA_NOT_EXIST`, `IGNORE`. |
+| save_mode_create_template             | string  | no       | -              | Custom DDL template used when auto-creating the target Hive table. Variables: `${database}`, `${table}`, `${rowtype_fields}`, `${rowtype_partition_fields}`, `${table_location}`, `${current_timestamp}`. |
+| common-options                        |         | no       | -              | Sink plugin common parameters. See [Sink Common Options](../common-options/sink-common-options.md). |
 
-| schema_save_mode                      | enum    | no       | CREATE_SCHEMA_WHEN_NOT_EXIST |
-| save_mode_create_template             | string  | no       | -              |
-| common-options                        |         | no       | -              |
+### use_table_compression [boolean]
+
+Default: `false`. Enable this option to inherit `orc.compress` from the metastore when preparing an **existing ORC table**. It does not change automatic table creation, non-ORC tables, or table metadata.
+
+For non-ORC tables, `use_table_compression` is ignored: no table compression property is inherited or validated. If the table does not exist when the sink is initialized and follows the automatic table-creation path, inheritance is also skipped, including `orc.compress` declared in `save_mode_create_template`. In both cases, enabling this option alone does not cause the job to fail; explicit `compress_codec` handling, existing defaults, and normal configuration validation and table-creation errors still apply.
+
+Priority: explicit `compress_codec` (including `NONE`) > table `orc.compress` when enabled > the existing default `NONE`. Table values are trimmed and matched without case sensitivity. Missing, null or blank properties retain the default. Unknown values or codecs without a supported ORC mapping fail during sink initialization instead of silently writing uncompressed files. In versions where ORC ZSTD maps to NONE, inherited ZSTD is rejected; verify your SeaTunnel version supports ORC ZSTD before using that table property. Downstream readers must support the selected codec.
+
+For an existing table created with `TBLPROPERTIES ('orc.compress'='SNAPPY')`:
+
+```hocon
+sink {
+  Hive {
+    table_name = "default.existing_orc_table"
+    metastore_uri = "thrift://metastore:9083"
+    use_table_compression = true
+    # Optional: compress_codec = "NONE" overrides the table property.
+  }
+}
+```
 
 ### table_name [string]
 
@@ -61,6 +87,31 @@ Target Hive table name eg: db1.table1, and if the source is multiple mode, you c
 ### metastore_uri [string]
 
 Hive metastore uri. Supports comma-separated multiple URIs for HA/failover (whitespace is ignored). SeaTunnel passes this value to Hive `hive.metastore.uris` and uses Hive `RetryingMetaStoreClient` (if available) to retry/failover between URIs. This is client-side endpoint failover; make sure your metastores share/replicate the same backend to keep metadata consistent.
+
+This option can be omitted when `hive.metastore.client.factory.class` selects an external metastore client through `hive_site_path`, `hive.hadoop.conf-path`, or `hive.hadoop.conf`. SeaTunnel does not fall back to an embedded metastore when neither a URI nor a client factory is configured.
+
+### AWS Glue Data Catalog
+
+AWS Glue Data Catalog can be used through the standard Hive metastore client factory:
+
+```hocon
+sink {
+  Hive {
+    table_name = "default.seatunnel_parquet"
+    hive.hadoop.conf = {
+      "hive.metastore.client.factory.class" = "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory"
+      # Optional when accessing a catalog in another AWS account
+      # "hive.metastore.glue.catalogid" = "123456789012"
+    }
+  }
+}
+```
+
+The AWS Glue Data Catalog client and a compatible patched Hive runtime must be available on every SeaTunnel process that creates or uses the Hive sink. Amazon EMR distributions that support Glue include these components, but they must still be visible to the SeaTunnel runtime classpath. For other deployments, install a mutually compatible Hive runtime and AWS Glue Data Catalog client.
+
+Authentication is handled by the AWS SDK default credential provider chain. Use the IAM role, web identity, container credentials, instance profile, environment, or shared configuration supported by the runtime instead of placing access keys in the SeaTunnel job configuration.
+
+If the configured factory class or its compatible Hive classes are missing, sink initialization fails without falling back to a local metastore.
 
 ### hdfs_site_path [string]
 
@@ -78,11 +129,13 @@ Properties in hadoop conf('core-site.xml', 'hdfs-site.xml', 'hive-site.xml')
 
 The specified loading path for the 'core-site.xml', 'hdfs-site.xml', 'hive-site.xml' files
 
+### remote_user [string]
+
+Hadoop remote user name used when connecting to HDFS/Hive storage without Kerberos credentials.
+
 ### krb5_path [string]
 
 The path of `krb5.conf`, used to authentication kerberos
-
-The path of `hive-site.xml`, used to authentication hive metastore
 
 ### kerberos_principal [string]
 
@@ -95,6 +148,8 @@ The keytab path of kerberos
 ### abort_drop_partition_metadata [boolean]
 
 Flag to decide whether to drop partition metadata from Hive Metastore during an abort operation. Note: this only affects the metadata in the metastore, the data in the partition will always be deleted(data generated during the synchronization process).
+
+The default value is `false`.
 
 ### parquet_avro_write_timestamp_as_int96 [boolean]
 
@@ -117,6 +172,8 @@ Select how to handle existing data on the target before writing new data.
 
 Note: overwrite=true and data_save_mode=DROP_DATA are equivalent. Use either one; do not set both.
 
+For batch jobs, use either `overwrite = true` or `data_save_mode = "DROP_DATA"` when the target Hive table should be replaced by the current run. For normal append jobs, keep the default `data_save_mode = "APPEND_DATA"`.
+
 ### schema_save_mode [enum]
 
 Before starting the synchronization task, different processing schemes are selected for the existing table structure on the target side.
@@ -133,7 +190,7 @@ Option values:
 
 ### save_mode_create_template [string]
 
-We use templates to automatically create Hive tables, which will create corresponding table creation statements based on the type of upstream data and schema type, and the default template can be modified according to the situation. Available template variables: ${database}, ${table}, ${rowtype_fields}, ${rowtype_partition_fields}, ${table_location}.
+We use templates to automatically create Hive tables, which will create corresponding table creation statements based on the type of upstream data and schema type, and the default template can be modified according to the situation. Available template variables: ${database}, ${table}, ${rowtype_fields}, ${rowtype_partition_fields}, ${table_location}, ${current_timestamp}.
 
 **Default value**: When not specified, uses a default PARQUET non-partitioned table template:
 ```sql
@@ -244,6 +301,7 @@ sink {
       bucket = "s3a://mybucket"
       fs.s3a.aws.credentials.provider="com.amazonaws.auth.InstanceProfileCredentialsProvider"
     }
+  }
 }
 ```
 
@@ -483,7 +541,7 @@ sink {
 }
 ```
 
-### example 2
+### example 3
 
 We have multiple source table like this:
 
@@ -584,6 +642,53 @@ sink {
   }
 }
 ```
+## FAQ
+
+### What file formats does Hive Sink support?
+
+Hive Sink supports `TEXT`, `PARQUET`, and `ORC` tables. The format is detected automatically from the Hive table's `STORED AS` clause (or from `save_mode_create_template` when the table is auto-created); there is no connector option to override it. Tables stored in any other format are rejected with `Hive connector only support [text parquet orc] table now`.
+
+### Does Hive Sink support partitioned tables?
+
+Yes. The partition columns are read from the Hive Metastore table definition (or from the `PARTITIONED BY` clause of `save_mode_create_template` when the table is auto-created), and SeaTunnel writes data into the correct partition directories automatically. There is no `partition_by` option on the Hive sink; the partition keys always come from the table definition:
+
+```hocon
+sink {
+  Hive {
+    table_name = "mydb.sales"
+    metastore_uri = "thrift://hive-metastore:9083"
+  }
+}
+```
+
+### How do I connect to a Kerberized Hadoop cluster?
+
+Provide the Kerberos keytab and principal in the connector configuration:
+
+```hocon
+sink {
+  Hive {
+    table_name = "mydb.events"
+    metastore_uri = "thrift://hive-metastore:9083"
+    kerberos_principal = "hive/host@REALM.COM"
+    kerberos_keytab_path = "/etc/security/keytabs/hive.keytab"
+    krb5_path = "/etc/krb5.conf"
+  }
+}
+```
+
+### Why do I see many small files in my Hive table?
+
+Small files are created when job parallelism is high or batches are small. To reduce small file counts:
+
+- Lower the job `parallelism` setting in the `env` block.
+- Increase `batch_size` so each task writes larger files.
+- Run a periodic compaction using Hive's `ALTER TABLE ... CONCATENATE` or a Spark merge job.
+
+### Does Hive Sink support schema evolution?
+
+Hive Sink reads the current table schema from the Hive Metastore. If columns are added to the upstream, they will only appear in Hive after the table DDL is updated. SeaTunnel does not automatically `ALTER TABLE` Hive schemas.
+
 ## Changelog
 
 <ChangeLog />

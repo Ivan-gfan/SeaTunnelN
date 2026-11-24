@@ -18,6 +18,10 @@
 
 package org.apache.seatunnel.e2e.connector.druid;
 
+import org.apache.seatunnel.shade.com.fasterxml.jackson.databind.JsonNode;
+import org.apache.seatunnel.shade.com.fasterxml.jackson.databind.node.ArrayNode;
+
+import org.apache.seatunnel.common.utils.JsonUtils;
 import org.apache.seatunnel.e2e.common.TestResource;
 import org.apache.seatunnel.e2e.common.TestSuiteBase;
 import org.apache.seatunnel.e2e.common.container.EngineType;
@@ -45,14 +49,13 @@ import lombok.extern.slf4j.Slf4j;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.Duration;
-import java.util.List;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 import static org.awaitility.Awaitility.given;
 
@@ -65,10 +68,12 @@ public class DruidIT extends TestSuiteBase implements TestResource {
     private static final String DATASOURCE = "testDataSource";
     private static final String MULTI_DATASOURCE_1 = "druid_sink_1";
     private static final String MULTI_DATASOURCE_2 = "druid_sink_2";
+    private static final String NULL_FIELD_DATASOURCE_PREFIX = "druid_null_field_";
+    private static final String NULL_FIELD_DATASOURCE_VARIABLE = "nullFieldDatasource";
     private static final String SQL_QUERY_TEMPLATE = "SELECT * FROM ";
-    private static final String CONF_PREFIX = "src/test/resources";
     private static final String DRUID_SERVICE_NAME = "router";
     private static final int DRUID_SERVICE_PORT = 8888;
+    private static final String COORDINATOR_URL_VARIABLE = "druidCoordinatorUrl";
     private DockerComposeContainer environment;
     private String coordinatorURL;
 
@@ -83,8 +88,10 @@ public class DruidIT extends TestSuiteBase implements TestResource {
                                 Wait.forListeningPort()
                                         .withStartupTimeout(Duration.ofSeconds(360)));
         environment.start();
-        changeCoordinatorURLConf(CONF_PREFIX + "/fakesource_to_druid.conf");
-        changeCoordinatorURLConf(CONF_PREFIX + "/fakesource_to_druid_with_multi.conf");
+        coordinatorURL =
+                InetAddress.getLocalHost().getHostAddress()
+                        + ":"
+                        + environment.getServicePort(DRUID_SERVICE_NAME, DRUID_SERVICE_PORT);
     }
 
     @AfterAll
@@ -95,7 +102,10 @@ public class DruidIT extends TestSuiteBase implements TestResource {
 
     @TestTemplate
     public void testDruidSink(TestContainer container) throws Exception {
-        Container.ExecResult execResult = container.executeJob("/fakesource_to_druid.conf");
+        Container.ExecResult execResult =
+                container.executeJob(
+                        "/fakesource_to_druid.conf",
+                        Collections.singletonList(COORDINATOR_URL_VARIABLE + "=" + coordinatorURL));
         Assertions.assertEquals(0, execResult.getExitCode());
 
         given().ignoreExceptions()
@@ -128,7 +138,9 @@ public class DruidIT extends TestSuiteBase implements TestResource {
     @TestTemplate
     public void testDruidMultiSink(TestContainer container) throws Exception {
         Container.ExecResult execResult =
-                container.executeJob("/fakesource_to_druid_with_multi.conf");
+                container.executeJob(
+                        "/fakesource_to_druid_with_multi.conf",
+                        Collections.singletonList(COORDINATOR_URL_VARIABLE + "=" + coordinatorURL));
         Assertions.assertEquals(0, execResult.getExitCode());
         // Check multi sink table 1
         given().ignoreExceptions()
@@ -159,29 +171,42 @@ public class DruidIT extends TestSuiteBase implements TestResource {
                         });
     }
 
-    private void changeCoordinatorURLConf(String resourceFilePath) throws UnknownHostException {
-        coordinatorURL = InetAddress.getLocalHost().getHostAddress() + ":8888";
-        Path path = Paths.get(resourceFilePath);
-        try {
-            List<String> lines = Files.readAllLines(path);
-            List<String> newLines =
-                    lines.stream()
-                            .map(
-                                    line -> {
-                                        if (line.contains("coordinatorUrl")) {
-                                            return "    coordinatorUrl = "
-                                                    + "\""
-                                                    + coordinatorURL
-                                                    + "\"";
-                                        }
-                                        return line;
-                                    })
-                            .collect(Collectors.toList());
-            Files.write(path, newLines);
-            log.info("Conf has been updated successfully.");
-        } catch (IOException e) {
-            throw new RuntimeException("Change conf error", e);
-        }
+    @TestTemplate
+    public void testDruidSinkWithNullFields(TestContainer container) throws Exception {
+        // The Druid cluster is shared by every engine this template runs on, so each run writes
+        // to its own datasource. Otherwise a run could pass on rows an earlier run indexed.
+        String datasource =
+                NULL_FIELD_DATASOURCE_PREFIX
+                        + container.identifier().name().toLowerCase(Locale.ROOT);
+        Container.ExecResult execResult =
+                container.executeJob(
+                        "/fakesource_to_druid_with_null.conf",
+                        Arrays.asList(
+                                COORDINATOR_URL_VARIABLE + "=" + coordinatorURL,
+                                NULL_FIELD_DATASOURCE_VARIABLE + "=" + datasource));
+        Assertions.assertEquals(0, execResult.getExitCode());
+        given().ignoreExceptions()
+                .await()
+                .atLeast(100L, TimeUnit.MILLISECONDS)
+                .atMost(400L, TimeUnit.SECONDS)
+                .untilAsserted(
+                        () -> {
+                            ArrayNode rows = JsonUtils.parseArray(getSelectResponse(datasource));
+                            // Rows 2 and 3 each have a null. Before the fix both were dropped,
+                            // because the null was left out of the CSV line. How Druid renders
+                            // the null itself depends on its null handling, so it is not
+                            // asserted.
+                            Assertions.assertEquals(3, rows.size(), rows.toString());
+                            Map<Long, JsonNode> rowsById = new HashMap<>();
+                            for (JsonNode row : rows) {
+                                rowsById.put(row.get("id").asLong(), row);
+                            }
+                            Assertions.assertEquals("a", rowsById.get(1L).get("name").asText());
+                            Assertions.assertEquals(10L, rowsById.get(1L).get("amount").asLong());
+                            // The value after the null name stayed in its own column.
+                            Assertions.assertEquals(20L, rowsById.get(2L).get("amount").asLong());
+                            Assertions.assertEquals("c", rowsById.get(3L).get("name").asText());
+                        });
     }
 
     private String getSelectResponse(String datasource) throws IOException {

@@ -10,6 +10,23 @@ Among all the Master nodes, only one Master node works at the same time, and the
 
 This is the most recommended usage method. In this mode, the load on the Master will be very low, and the Master has more resources for job scheduling, task fault tolerance index monitoring, and providing RESTful API services, etc., and will have higher stability. At the same time, the Worker node does not store Imap data. All Imap data is stored on the Master node. Even if the Worker node has a high load or crashes, it will not cause the Imap data to be redistributed.
 
+## Minimum Deployment Configuration
+
+The following table lists the minimum and HA-recommended node counts for each role in a separated cluster. Refer to the subsequent sections for detailed parameter descriptions.
+
+**Node Requirements**
+
+| Role | Minimum Count | Recommended (HA) | Description |
+|------|---------------|------------------|-------------|
+| Master | 1 | 2 | Responsible for scheduling and IMap data storage. |
+| Worker | 1 | 2+ | Responsible for task execution. |
+
+:::tip
+
+A single Master node can start and run normally, but provides no high availability. For HA, deploy at least 2 Master nodes: the default `backup-count: 1` requires at least 2 Master nodes to place IMap backup replicas. Without a second Master, a single Master failure will leave the cluster unable to recover.
+
+:::
+
 ## 1. Download
 
 [Download And Make SeaTunnel Installation Package](download-seatunnel.md)
@@ -29,8 +46,8 @@ The JVM parameters of the Master node are configured in the `$SEATUNNEL_HOME/con
 
 ```shell
 # JVM Heap
--Xms2g
--Xmx2g
+-Xms16g
+-Xmx16g
 
 # JVM Dump
 -XX:+HeapDumpOnOutOfMemoryError
@@ -47,8 +64,8 @@ The JVM parameters of the Worker node are configured in the `$SEATUNNEL_HOME/con
 
 ```shell
 # JVM Heap
--Xms2g
--Xmx2g
+-Xms16g
+-Xmx16g
 
 # JVM Dump
 -XX:+HeapDumpOnOutOfMemoryError
@@ -61,6 +78,8 @@ The JVM parameters of the Worker node are configured in the `$SEATUNNEL_HOME/con
 -XX:+UseG1GC
 ```
 
+The examples above use a 16 GB JVM heap. For large-scale data processing, a 32 GB JVM heap is recommended.
+
 ## 4. Configure SeaTunnel Engine
 
 SeaTunnel Engine provides many functions and needs to be configured in `seatunnel.yaml`.
@@ -71,7 +90,7 @@ SeaTunnel Engine implements cluster management based on [Hazelcast IMDG](https:/
 
 The `backup count` is a parameter that defines the number of synchronous backups. For example, if it is set to 1, the backup of the partition will be placed on one other member. If it is set to 2, it will be placed on two other members.
 
-We recommend that the value of `backup-count` be `max(1, min(5, N/2))`. `N` is the number of cluster nodes.
+We recommend that the value of `backup-count` be `max(1, min(5, N/2))`. `N` is the number of Master nodes.
 
 ```yaml
 seatunnel:
@@ -175,6 +194,22 @@ seatunnel:
     history-job-expire-minutes: 1440
 ```
 
+SeaTunnel also retains terminal job state in distributed maps for a short time before removing it. This retention is controlled by `state-cleanup-delay-ms`, whose default value is `60000` milliseconds. Keeping the terminal tombstone briefly allows late asynchronous callbacks to observe an end state instead of a missing map entry. Setting it to `0` restores more aggressive cleanup but also narrows the protection window for terminal-state races.
+
+```yaml
+seatunnel:
+  engine:
+    state-cleanup-delay-ms: 60000
+```
+
+The `/system-monitoring-information` REST API asks every cluster member for its health metrics. All members share one deadline controlled by `health-metrics-timeout-seconds`, whose default value is `3` seconds. A member that does not answer within this deadline is reported with its address and a `timeout` marker instead of blocking the whole response, so the total latency of the API no longer grows with the number of unreachable members.
+
+```yaml
+seatunnel:
+  engine:
+    health-metrics-timeout-seconds: 3
+```
+
 ### 4.5 Class Loader Cache Mode
 
 This configuration mainly solves the problem of resource leakage caused by continuously creating and attempting to destroy class loaders.
@@ -207,7 +242,7 @@ The following describes how to use the MapStore persistence configuration. For d
 
 **type**
 
-The type of IMap persistence, currently only supports `hdfs`.
+The type of IMap persistence. Currently, only `hdfs` is supported.
 
 **namespace**
 
@@ -255,6 +290,13 @@ map:
         fs.defaultFS: file:///
 ```
 
+Note: `engine_runningJobMetrics` stores high-frequency runtime metrics snapshots and
+`engine_checkpoint_monitor` stores the checkpoint overview and history served by the REST API.
+Both are intentionally excluded from persistent IMAP storage even when `map.engine*` uses
+`map-store`. This avoids excessive WAL growth for observability-only state. After an engine
+restart, running-job metrics are rebuilt from subsequent reports and the checkpoint overview and
+history start again from the next checkpoint, instead of continuing from the pre-restart state.
+
 If you use OSS, you can configure it like this:
 
 ```yaml
@@ -276,15 +318,27 @@ map:
         fs.oss.endpoint: OSS endpoint
 ```
 
+To use OSS credentials from environment variables, remove `fs.oss.accessKeyId` and
+`fs.oss.accessKeySecret` and add:
+
+```yaml
+        fs.oss.credentials.provider: com.aliyun.oss.common.auth.EnvironmentVariableCredentialsProvider
+```
+
+The provider reads `OSS_ACCESS_KEY_ID` and `OSS_ACCESS_KEY_SECRET`, plus optional
+`OSS_SESSION_TOKEN`.
+
 Notice: When using OSS, make sure that the following jars are in the lib directory.
 
+The `seatunnel-shade-hadoop3-uber` JAR comes from the [Apache SeaTunnel Shade](https://github.com/apache/seatunnel-shade) project, which provides a shaded (package-relocated) version of the Hadoop client. All third-party classes are relocated under `org.apache.seatunnel.shade.*` to avoid classpath conflicts with SeaTunnel's own dependencies. Use the Hadoop Uber JAR bundled in the SeaTunnel distribution's `lib/` directory.
+
 ```
-aliyun-sdk-oss-3.13.2.jar
-hadoop-aliyun-3.3.6.jar
-jdom2-2.0.6.jar
-netty-buffer-4.1.89.Final.jar 
+aliyun-sdk-oss-3.4.1.jar
+hadoop-aliyun-3.1.4.jar
+jdom-1.1.jar
+netty-buffer-4.1.89.Final.jar
 netty-common-4.1.89.Final.jar
-seatunnel-hadoop3-3.1.4-uber.jar
+seatunnel-shade-hadoop3-uber-*.jar
 ```
 
 It is possible to utilize S3 for IMAP storage. 
@@ -314,11 +368,50 @@ map:
          fs.s3a.aws.credentials.provider: org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
 ```
 
+For environment-variable credentials, remove `fs.s3a.access.key` and `fs.s3a.secret.key` and use
+`fs.s3a.aws.credentials.provider: com.amazonaws.auth.EnvironmentVariableCredentialsProvider`.
+The provider reads `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, plus optional
+`AWS_SESSION_TOKEN`.
+
 Notice: When using S3, make sure that the following jars are in the lib directory.
 
+Both JARs come from the [Apache SeaTunnel Shade](https://github.com/apache/seatunnel-shade) project:
+- `seatunnel-shade-hadoop3-uber` — shaded Hadoop client with relocated packages
+- `seatunnel-shade-hadoop-aws` — shaded Hadoop AWS connector with relocated packages
+
+Use the Hadoop Uber JAR bundled in the SeaTunnel distribution's `lib/` directory.
+
 ```
-seatunnel-hadoop3-3.1.4-uber.jar
-seatunnel-hadoop-aws.jar
+seatunnel-shade-hadoop3-uber-*.jar
+seatunnel-shade-hadoop-aws-${seatunnel.shade.hadoop-aws.version}-${seatunnel.shade.version}.jar
+```
+
+If you use GCS, you can configure it like this:
+
+```yaml
+map:
+  engine*:
+    map-store:
+      enabled: true
+      initial-mode: EAGER
+      factory-class-name: org.apache.seatunnel.engine.server.persistence.FileMapStoreFactory
+      properties:
+        type: hdfs
+        namespace: /seatunnel/imap
+        clusterName: seatunnel-cluster
+        storage.type: gcs
+        gcs.bucket: gs://your-bucket
+        # optional, Application Default Credentials (e.g. GKE Workload Identity) are used when absent
+        fs.gs.auth.service.account.json.keyfile: /path/to/service-account-key.json
+```
+
+Notice: The IMap WAL writer rewrites its current object on every update (the same as for S3 and OSS), and GCS allows about one write per second to the same object name. GCS IMap persistence is therefore best suited to low or moderate IMap update rates.
+
+Notice: When using GCS, make sure that the following jars are in the lib directory.
+
+```
+gcs-connector-hadoop3-2.2.33-shaded.jar
+seatunnel-shade-hadoop3-uber-*.jar
 ```
 
 ### 4.7 Job Scheduling Strategy
@@ -350,14 +443,16 @@ The corePoolSize of seatunnel coordinator job's executor cached thread pool
 
 **max-thread-num**
 
-The max job count can be executed at same time
+The maximum number of threads in the coordinator service executor (the `maximumPoolSize` of its thread pool). The default is `Integer.MAX_VALUE`.
 
 Example
 
 ```yaml
-coordinator-service:
-  core-thread-num: 30
-  max-thread-num: 1000
+seatunnel:
+  engine:
+    coordinator-service:
+      core-thread-num: 30
+      max-thread-num: 1000
 ```
 
 ### 4.9 Job Metrics Partition Count (This parameter is invalid on the Worker node)
@@ -493,6 +588,10 @@ mkdir -p $SEATUNNEL_HOME/logs
 ```
 
 The logs will be written to `$SEATUNNEL_HOME/logs/seatunnel-engine-worker.log`.
+
+> A Worker started before any Master will keep retrying the configured master addresses for up to
+> `hazelcast.max.join.seconds` (default 300s) and log `This lite member cannot assume the master
+> role ...` while waiting.
 
 ## 8. Submit And Manage Jobs
 

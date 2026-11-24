@@ -18,7 +18,6 @@
 
 package org.apache.seatunnel.connectors.seatunnel.jdbc;
 
-import org.apache.seatunnel.shade.com.google.common.collect.Lists;
 import org.apache.seatunnel.shade.org.apache.commons.lang3.tuple.Pair;
 
 import org.apache.seatunnel.api.configuration.ReadonlyConfig;
@@ -38,6 +37,7 @@ import org.apache.seatunnel.e2e.common.TestResource;
 import org.apache.seatunnel.e2e.common.TestSuiteBase;
 
 import org.jetbrains.annotations.NotNull;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -56,7 +56,9 @@ import java.sql.Connection;
 import java.sql.Date;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.LocalDate;
@@ -65,8 +67,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -83,7 +87,7 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
 
     private static final String MYSQL_USERNAME = "root";
     private static final String MYSQL_PASSWORD = "Abc!@#135_seatunnel";
-    private static final int MYSQL_PORT = 3312;
+    private static final int MYSQL_CONTAINER_PORT = 3306;
 
     private MySQLContainer<?> mysql_container;
 
@@ -122,6 +126,7 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
                     + "    `c_mediumtext`           mediumtext,\n"
                     + "    `c_text`                 text,\n"
                     + "    `c_varchar`              varchar(255)          DEFAULT NULL,\n"
+                    + "    `c_varchar_bin`          varchar(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n"
                     + "    `c_json`                 json                  DEFAULT NULL,\n"
                     + "    `c_longtext`             longtext,\n"
                     + "    `c_date`                 date                  DEFAULT NULL,\n"
@@ -153,14 +158,12 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
                         .withDatabaseName(MYSQL_DATABASE)
                         .withNetwork(NETWORK)
                         .withNetworkAliases(MYSQL_CONTAINER_HOST)
-                        .withExposedPorts(MYSQL_PORT)
+                        .withExposedPorts(MYSQL_CONTAINER_PORT)
                         .waitingFor(Wait.forHealthcheck())
                         .withLogConsumer(
                                 new Slf4jLogConsumer(DockerLoggerFactory.getLogger(MYSQL_IMAGE)));
-        mysql_container.setPortBindings(
-                Lists.newArrayList(String.format("%s:%s", MYSQL_PORT, 3306)));
-
         Startables.deepStart(Stream.of(mysql_container)).join();
+        mysqlUrlInfo = JdbcUrlUtil.getUrlInfo(mysql_container.getJdbcUrl());
     }
 
     @BeforeAll
@@ -266,6 +269,7 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
                     "c_mediumtext",
                     "c_text",
                     "c_varchar",
+                    "c_varchar_bin",
                     "c_json",
                     "c_longtext",
                     "c_date",
@@ -327,6 +331,7 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
                                 String.format("f1_%s", i),
                                 String.format("f1_%s", i),
                                 String.format("f1_%s", i),
+                                String.format("key%05d", i),
                                 String.format("{\"aa\":\"bb_%s\"}", i),
                                 String.format("f1_%s", i),
                                 Date.valueOf(currentDate),
@@ -348,9 +353,94 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
         return Pair.of(fieldNames, rows);
     }
 
-    static JdbcUrlUtil.UrlInfo mysqlUrlInfo =
-            JdbcUrlUtil.getUrlInfo(
-                    String.format("jdbc:mysql://localhost:%s/auto?useSSL=false", MYSQL_PORT));
+    private JdbcUrlUtil.UrlInfo mysqlUrlInfo;
+
+    @Test
+    public void testFixedDateSplitsReadEveryRow() throws Exception {
+        String tableName = "split_date_review";
+        TablePath tablePath = TablePath.of(MYSQL_DATABASE, tableName);
+        Map<String, Object> configMap = new HashMap<>();
+        configMap.put("url", mysqlUrlInfo.getUrlWithDatabase().get());
+        configMap.put("driver", "com.mysql.cj.jdbc.Driver");
+        configMap.put("user", MYSQL_USERNAME);
+        configMap.put("password", MYSQL_PASSWORD);
+        configMap.put("query", "SELECT * FROM " + tableName);
+        configMap.put("partition_column", "created_on");
+        try (Connection connection =
+                        DriverManager.getConnection(
+                                mysqlUrlInfo.getUrlWithDatabase().get(),
+                                MYSQL_USERNAME,
+                                MYSQL_PASSWORD);
+                Statement statement = connection.createStatement();
+                MySqlCatalog catalog =
+                        new MySqlCatalog(
+                                "mysql", MYSQL_USERNAME, MYSQL_PASSWORD, mysqlUrlInfo, null)) {
+            statement.execute(
+                    "CREATE TABLE " + tableName + " (id INT PRIMARY KEY, created_on DATE)");
+            try {
+                try (PreparedStatement insert =
+                        connection.prepareStatement(
+                                "INSERT INTO " + tableName + " VALUES (?, ?)")) {
+                    for (int id = 0; id <= 11; id++) {
+                        insert.setInt(1, id);
+                        insert.setDate(2, Date.valueOf(LocalDate.of(2024, 1, 1).plusDays(id - 1)));
+                        insert.addBatch();
+                    }
+                    insert.executeBatch();
+                }
+                catalog.open();
+                CatalogTable catalogTable = catalog.getTable(tablePath);
+                for (String[] bounds :
+                        new String[][] {
+                            {null, null}, {"2024-01-01", "2024-01-10"}, {"19723", "19732"}
+                        }) {
+                    for (int partitions : new int[] {3, 20}) {
+                        JdbcSourceTable sourceTable =
+                                JdbcSourceTable.builder()
+                                        .tablePath(tablePath)
+                                        .catalogTable(catalogTable)
+                                        .query("SELECT * FROM " + tableName)
+                                        .partitionColumn("created_on")
+                                        .partitionNumber(partitions)
+                                        .partitionStart(bounds[0])
+                                        .partitionEnd(bounds[1])
+                                        .build();
+                        try (FixedChunkSplitter splitter = getFixedChunkSplitter(configMap)) {
+                            Collection<JdbcSourceSplit> splits =
+                                    splitter.generateSplits(sourceTable);
+                            int firstId = bounds[0] == null ? 0 : 1;
+                            int lastId = bounds[1] == null ? 11 : 10;
+                            Assertions.assertEquals(
+                                    Math.min(partitions, lastId - firstId + 1), splits.size());
+                            Set<Integer> ids = new HashSet<>();
+                            for (JdbcSourceSplit split : splits) {
+                                try (PreparedStatement query =
+                                                splitter.generateSplitStatement(
+                                                        split, catalogTable.getTableSchema());
+                                        ResultSet rows = query.executeQuery()) {
+                                    while (rows.next()) {
+                                        Assertions.assertTrue(
+                                                ids.add(rows.getInt("id")), "Split rows overlap");
+                                        Assertions.assertEquals(
+                                                LocalDate.of(2024, 1, 1)
+                                                        .plusDays(rows.getInt("id") - 1),
+                                                rows.getDate("created_on").toLocalDate());
+                                    }
+                                }
+                            }
+                            Set<Integer> expected = new HashSet<>();
+                            for (int id = firstId; id <= lastId; id++) {
+                                expected.add(id);
+                            }
+                            Assertions.assertEquals(expected, ids);
+                        }
+                    }
+                }
+            } finally {
+                statement.execute("DROP TABLE IF EXISTS " + tableName);
+            }
+        }
+    }
 
     @Test
     public void testSplit() throws Exception {
@@ -466,6 +556,22 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
         configMap.put("partition_column", "c_date");
         assertDateSplit(splitArray);
 
+        configMap.put("split.string-strategy", "none");
+        splitArray = getCheckedSplitArray(configMap, table, "c_varchar", 1);
+        assertStringSingleSplit(splitArray);
+
+        configMap.put("split.string-strategy", "hash");
+        splitArray = getCheckedSplitArray(configMap, table, "c_varchar", 11);
+        assertStringHashSplit(splitArray);
+
+        configMap.put("split.string-strategy", "range");
+        splitArray = getCheckedSplitArray(configMap, table, "c_varchar_bin", 11);
+        assertStringRangeSplit(splitArray);
+
+        configMap.put("split.string-strategy", "auto");
+        splitArray = getCheckedSplitArray(configMap, table, "c_varchar_bin", 11);
+        assertStringRangeSplit(splitArray);
+
         mySqlCatalog.close();
     }
 
@@ -534,6 +640,32 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
         }
     }
 
+    private void assertStringSingleSplit(JdbcSourceSplit[] splitArray) {
+        Assertions.assertEquals(1, splitArray.length);
+        Assertions.assertNull(splitArray[0].getSplitStart());
+        Assertions.assertNull(splitArray[0].getSplitEnd());
+    }
+
+    private void assertStringHashSplit(JdbcSourceSplit[] splitArray) {
+        Assertions.assertTrue(splitArray.length > 1);
+        for (JdbcSourceSplit split : splitArray) {
+            Assertions.assertTrue(split.getSplitStart() instanceof Integer);
+            Assertions.assertNull(split.getSplitEnd());
+        }
+    }
+
+    private void assertStringRangeSplit(JdbcSourceSplit[] splitArray) {
+        Assertions.assertTrue(splitArray.length > 1);
+        Assertions.assertNull(splitArray[0].getSplitStart());
+        for (int i = 0; i < splitArray.length; i++) {
+            if (i == splitArray.length - 1) {
+                Assertions.assertNull(splitArray[i].getSplitEnd());
+                continue;
+            }
+            Assertions.assertTrue(splitArray[i].getSplitEnd() instanceof String);
+        }
+    }
+
     @NotNull private DynamicChunkSplitter getDynamicChunkSplitter(Map<String, Object> configMap) {
         ReadonlyConfig readonlyConfig = ReadonlyConfig.fromMap(configMap);
         JdbcSourceConfig sourceConfig = JdbcSourceConfig.of(readonlyConfig);
@@ -549,6 +681,7 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
     }
 
     @Override
+    @AfterAll
     public void tearDown() throws Exception {
         if (mysql_container != null) {
             mysql_container.close();
@@ -614,6 +747,7 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
                 }
             } catch (Exception e) {
                 LOG.error("Error splitting on column {}: {}", charColumn, e.getMessage(), e);
+                Assertions.fail("Error splitting on column " + charColumn, e);
             }
         }
 
@@ -673,9 +807,52 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
                 }
             } catch (Exception e) {
                 LOG.error("Error splitting on column {}: {}", charColumn, e.getMessage(), e);
+                Assertions.fail("Error splitting on column " + charColumn, e);
             }
         }
 
+        mySqlCatalog.close();
+    }
+
+    @Test
+    public void testSampleShardingAllowSwitch() throws Exception {
+        Map<String, Object> baseConfig = new HashMap<>();
+        baseConfig.put("url", mysqlUrlInfo.getUrlWithDatabase().get());
+        baseConfig.put("driver", "com.mysql.cj.jdbc.Driver");
+        baseConfig.put("username", MYSQL_USERNAME);
+        baseConfig.put("password", MYSQL_PASSWORD);
+        baseConfig.put("table_path", MYSQL_DATABASE + "." + MYSQL_TABLE);
+        baseConfig.put("split.size", "3");
+        baseConfig.put("split.even-distribution.factor.upper-bound", 0.5d); // Forced uneven
+        baseConfig.put("split.sample-sharding.threshold", 10);
+        TablePath tablePathMySql = TablePath.of(MYSQL_DATABASE, MYSQL_TABLE);
+        MySqlCatalog mySqlCatalog =
+                new MySqlCatalog("mysql", MYSQL_USERNAME, MYSQL_PASSWORD, mysqlUrlInfo, null);
+        mySqlCatalog.open();
+        CatalogTable table = mySqlCatalog.getTable(tablePathMySql);
+        JdbcSourceTable jdbcSourceTable =
+                JdbcSourceTable.builder().tablePath(tablePathMySql).catalogTable(table).build();
+
+        // enable default true
+        Map<String, Object> enabledConfig = new HashMap<>(baseConfig);
+        Collection<JdbcSourceSplit> enabledSplits =
+                getDynamicChunkSplitter(enabledConfig).generateSplits(jdbcSourceTable);
+
+        // enable set is false
+        Map<String, Object> disabledConfig = new HashMap<>(baseConfig);
+        disabledConfig.put("split.allow-sampling", false);
+        Collection<JdbcSourceSplit> disabledSplits =
+                getDynamicChunkSplitter(disabledConfig).generateSplits(jdbcSourceTable);
+
+        Assertions.assertFalse(enabledSplits.isEmpty(), "Enabled splits should not be empty");
+        Assertions.assertFalse(disabledSplits.isEmpty(), "Disabled splits should not be empty");
+        LOG.info("Sample sharding enabled: {} splits", enabledSplits.size());
+        LOG.info("Sample sharding disabled: {} splits", disabledSplits.size());
+
+        Assertions.assertNotEquals(
+                enabledSplits.size(),
+                disabledSplits.size(),
+                "Enable and disable should produce different split counts");
         mySqlCatalog.close();
     }
 
@@ -704,5 +881,199 @@ public class JdbcMysqlSplitIT extends TestSuiteBase implements TestResource {
                 Assertions.assertNotNull(end, "Middle split should have non-null end");
             }
         }
+    }
+
+    @Test
+    public void testFixedNumericSplitsReadAllRows() throws Exception {
+        try (Connection connection = getJdbcConnection();
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE "
+                            + MYSQL_DATABASE
+                            + ".fixed_numeric_uneven (id BIGINT PRIMARY KEY)");
+            try {
+                try (PreparedStatement insert =
+                        connection.prepareStatement(
+                                "INSERT INTO "
+                                        + MYSQL_DATABASE
+                                        + ".fixed_numeric_uneven (id) VALUES (?)")) {
+                    for (int id = 0; id <= 2002; id++) {
+                        insert.setLong(1, id);
+                        insert.addBatch();
+                    }
+                    insert.executeBatch();
+                }
+
+                Map<String, Object> configMap = new HashMap<>();
+                configMap.put("url", mysqlUrlInfo.getUrlWithDatabase().get());
+                configMap.put("driver", "com.mysql.cj.jdbc.Driver");
+                configMap.put("username", MYSQL_USERNAME);
+                configMap.put("password", MYSQL_PASSWORD);
+                configMap.put(
+                        "query", "SELECT id FROM " + MYSQL_DATABASE + ".fixed_numeric_uneven");
+                configMap.put("partition_column", "id");
+
+                TablePath tablePath = TablePath.of(MYSQL_DATABASE, "fixed_numeric_uneven");
+                try (MySqlCatalog mySqlCatalog =
+                                new MySqlCatalog(
+                                        "mysql",
+                                        MYSQL_USERNAME,
+                                        MYSQL_PASSWORD,
+                                        mysqlUrlInfo,
+                                        null);
+                        FixedChunkSplitter splitter = getFixedChunkSplitter(configMap)) {
+                    mySqlCatalog.open();
+                    CatalogTable table = mySqlCatalog.getTable(tablePath);
+                    JdbcSourceTable jdbcSourceTable =
+                            JdbcSourceTable.builder()
+                                    .tablePath(tablePath)
+                                    .catalogTable(table)
+                                    .query(
+                                            "SELECT id FROM "
+                                                    + MYSQL_DATABASE
+                                                    + ".fixed_numeric_uneven")
+                                    .partitionColumn("id")
+                                    .partitionNumber(1000)
+                                    .partitionStart("1")
+                                    .partitionEnd("2001")
+                                    .build();
+
+                    Set<Long> uniqueIds = new HashSet<>();
+                    for (JdbcSourceSplit split : splitter.generateSplits(jdbcSourceTable)) {
+                        try (PreparedStatement splitStatement =
+                                        splitter.generateSplitStatement(
+                                                split, table.getTableSchema());
+                                ResultSet resultSet = splitStatement.executeQuery()) {
+                            while (resultSet.next()) {
+                                long id = resultSet.getLong(1);
+                                Assertions.assertTrue(
+                                        id >= 1 && id <= 2001, "id out of range: " + id);
+                                Assertions.assertTrue(uniqueIds.add(id), "duplicated id: " + id);
+                            }
+                        }
+                    }
+                    Assertions.assertEquals(2001, uniqueIds.size());
+                }
+            } finally {
+                statement.execute(
+                        "DROP TABLE IF EXISTS " + MYSQL_DATABASE + ".fixed_numeric_uneven");
+            }
+        }
+    }
+
+    /**
+     * Range split queries never match NULL, so the automatic selection must not split by a nullable
+     * unique key: a table with only such a key is read as one split, and a table that also has a
+     * NOT NULL unique key is split by that one. Every row is read once in both cases.
+     */
+    @Test
+    public void testNullableUniqueKeyIsNotChosenAsSplitKey() throws Exception {
+        try (Connection connection = getJdbcConnection();
+                Statement statement = connection.createStatement()) {
+            String nullableOnly = "nullable_unique_key_only";
+            String withNotNull = "nullable_and_not_null_unique_keys";
+            try {
+                // No primary key; the unique key code is nullable and holds 10 NULL values.
+                statement.execute(
+                        "CREATE TABLE "
+                                + MYSQL_DATABASE
+                                + "."
+                                + nullableOnly
+                                + " (id INT NOT NULL, code INT NULL, UNIQUE KEY uk_code (code))");
+                statement.execute(
+                        "CREATE TABLE "
+                                + MYSQL_DATABASE
+                                + "."
+                                + withNotNull
+                                + " (id INT NOT NULL, code INT NULL, no INT NOT NULL,"
+                                + " UNIQUE KEY uk_code (code), UNIQUE KEY uk_no (no))");
+                insertRowsWithNullCodes(connection, nullableOnly, false);
+                insertRowsWithNullCodes(connection, withNotNull, true);
+
+                Map<String, Object> configMap = new HashMap<>();
+                configMap.put("url", mysqlUrlInfo.getUrlWithDatabase().get());
+                configMap.put("driver", "com.mysql.cj.jdbc.Driver");
+                configMap.put("username", MYSQL_USERNAME);
+                configMap.put("password", MYSQL_PASSWORD);
+                configMap.put("split.size", "10");
+
+                try (MySqlCatalog mySqlCatalog =
+                                new MySqlCatalog(
+                                        "mysql",
+                                        MYSQL_USERNAME,
+                                        MYSQL_PASSWORD,
+                                        mysqlUrlInfo,
+                                        null);
+                        DynamicChunkSplitter splitter = getDynamicChunkSplitter(configMap)) {
+                    mySqlCatalog.open();
+
+                    Collection<JdbcSourceSplit> splits =
+                            readEveryIdOnce(splitter, mySqlCatalog, nullableOnly);
+                    Assertions.assertEquals(1, splits.size());
+                    Assertions.assertNull(splits.iterator().next().getSplitKeyName());
+
+                    splits = readEveryIdOnce(splitter, mySqlCatalog, withNotNull);
+                    Assertions.assertTrue(splits.size() > 1, "splits: " + splits.size());
+                    for (JdbcSourceSplit split : splits) {
+                        Assertions.assertEquals("no", split.getSplitKeyName());
+                    }
+                }
+            } finally {
+                statement.execute("DROP TABLE IF EXISTS " + MYSQL_DATABASE + "." + nullableOnly);
+                statement.execute("DROP TABLE IF EXISTS " + MYSQL_DATABASE + "." + withNotNull);
+            }
+        }
+    }
+
+    /** Inserts ids 1 to 100; every tenth row has a NULL code. */
+    private void insertRowsWithNullCodes(Connection connection, String table, boolean withNo)
+            throws SQLException {
+        String sql =
+                "INSERT INTO "
+                        + MYSQL_DATABASE
+                        + "."
+                        + table
+                        + (withNo ? " VALUES (?, ?, ?)" : " VALUES (?, ?)");
+        try (PreparedStatement insert = connection.prepareStatement(sql)) {
+            for (int id = 1; id <= 100; id++) {
+                insert.setInt(1, id);
+                insert.setObject(2, id % 10 == 0 ? null : id);
+                if (withNo) {
+                    insert.setInt(3, id);
+                }
+                insert.addBatch();
+            }
+            insert.executeBatch();
+        }
+    }
+
+    /**
+     * Plans the splits of a table filled by {@link #insertRowsWithNullCodes} from its real MySQL
+     * catalog metadata, runs the query of every split, and asserts that each of the 100 ids is read
+     * exactly once: a duplicate fails at once, a row that no split reads fails the final count.
+     *
+     * @return the planned splits, so the caller can check which split key was chosen
+     */
+    private Collection<JdbcSourceSplit> readEveryIdOnce(
+            DynamicChunkSplitter splitter, MySqlCatalog catalog, String tableName)
+            throws Exception {
+        TablePath tablePath = TablePath.of(MYSQL_DATABASE, tableName);
+        CatalogTable table = catalog.getTable(tablePath);
+        Collection<JdbcSourceSplit> splits =
+                splitter.generateSplits(
+                        JdbcSourceTable.builder().tablePath(tablePath).catalogTable(table).build());
+        Set<Integer> ids = new HashSet<>();
+        for (JdbcSourceSplit split : splits) {
+            try (PreparedStatement splitStatement =
+                            splitter.generateSplitStatement(split, table.getTableSchema());
+                    ResultSet resultSet = splitStatement.executeQuery()) {
+                while (resultSet.next()) {
+                    int id = resultSet.getInt("id");
+                    Assertions.assertTrue(ids.add(id), "duplicated id: " + id);
+                }
+            }
+        }
+        Assertions.assertEquals(100, ids.size(), tableName);
+        return splits;
     }
 }

@@ -32,6 +32,7 @@ import org.apache.seatunnel.engine.core.job.JobImmutableInformation;
 import org.apache.seatunnel.engine.server.SeaTunnelServer;
 import org.apache.seatunnel.engine.server.dag.execution.ExecutionVertex;
 import org.apache.seatunnel.engine.server.execution.ExecutionState;
+import org.apache.seatunnel.engine.server.execution.Task;
 import org.apache.seatunnel.engine.server.execution.TaskDeployState;
 import org.apache.seatunnel.engine.server.execution.TaskExecutionState;
 import org.apache.seatunnel.engine.server.execution.TaskGroup;
@@ -39,6 +40,7 @@ import org.apache.seatunnel.engine.server.execution.TaskGroupDefaultImpl;
 import org.apache.seatunnel.engine.server.execution.TaskGroupLocation;
 import org.apache.seatunnel.engine.server.master.JobMaster;
 import org.apache.seatunnel.engine.server.resourcemanager.resource.SlotProfile;
+import org.apache.seatunnel.engine.server.task.SourceSeaTunnelTask;
 import org.apache.seatunnel.engine.server.task.TaskGroupImmutableInformation;
 import org.apache.seatunnel.engine.server.task.operation.CancelTaskOperation;
 import org.apache.seatunnel.engine.server.task.operation.CheckTaskGroupIsExecutingOperation;
@@ -322,7 +324,14 @@ public class PhysicalVertex {
         TaskGroupImmutableInformation taskGroupImmutableInformation =
                 getTaskGroupImmutableInformation();
         TaskDeployState state = taskGroupConsumer.apply(taskGroupImmutableInformation);
-        updateTaskState(ExecutionState.RUNNING);
+        return finishDeployment(state);
+    }
+
+    @VisibleForTesting
+    TaskDeployState finishDeployment(TaskDeployState state) {
+        if (state.isSuccess()) {
+            updateTaskState(ExecutionState.RUNNING);
+        }
         return state;
     }
 
@@ -348,9 +357,42 @@ public class PhysicalVertex {
         return taskGroup;
     }
 
+    /**
+     * Recognizes a FINISHED group containing only unbounded sources (and optional downstream
+     * tasks). During restore of a RUNNING pipeline with RUNNING coordinators, this is the shape of
+     * an idle-closed reader group; it does not prove the original reason for closure.
+     *
+     * @param executionState state read once by {@code SubPlan#isRecoverableRunningState} for this
+     *     vertex; the coordinator re-reads the IMap in its own restore step
+     */
+    @VisibleForTesting
+    boolean isRecoverableFinishedStateForRunningPipelineRestore(ExecutionState executionState) {
+        if (!ExecutionState.FINISHED.equals(executionState)) {
+            return false;
+        }
+        boolean hasSource = false;
+        for (Task task : taskGroup.getTasks()) {
+            if (task instanceof SourceSeaTunnelTask) {
+                hasSource = true;
+                if (!((SourceSeaTunnelTask<?, ?>) task).isUnboundedSourceTask()) {
+                    return false;
+                }
+            }
+        }
+        return hasSource;
+    }
+
     public synchronized void updateTaskState(@NonNull ExecutionState targetState) {
         try {
             ExecutionState current = (ExecutionState) runningJobStateIMap.get(taskGroupLocation);
+            if (current == null) {
+                log.warn(
+                        "{} current state is null, skip transition to {}. Task execution location: {}",
+                        taskFullName,
+                        targetState,
+                        taskGroupLocation);
+                return;
+            }
             log.debug(
                     String.format(
                             "Try to update the task %s state from %s to %s",
@@ -375,7 +417,9 @@ public class PhysicalVertex {
             RetryUtils.retryWithException(
                     () -> {
                         updateStateTimestamps(targetState);
-                        runningJobStateIMap.set(taskGroupLocation, targetState);
+                        if (runningJobStateIMap.get(taskGroupLocation) != null) {
+                            runningJobStateIMap.set(taskGroupLocation, targetState);
+                        }
                         return null;
                     },
                     new RetryUtils.RetryMaterial(
@@ -396,9 +440,17 @@ public class PhysicalVertex {
         }
     }
 
+    /**
+     * Requests cancellation and publishes any terminal result received while state processing was
+     * stopped for pipeline restore.
+     */
     public synchronized void cancel() {
         if (!getExecutionState().isEndState()) {
             updateTaskState(ExecutionState.CANCELING);
+        } else if (!taskFuture.isDone()) {
+            // A late terminal callback may arrive before this vertex resumes. Its new completion
+            // future still needs to be resolved without changing the terminal state.
+            stateProcess();
         }
     }
 
@@ -412,12 +464,10 @@ public class PhysicalVertex {
         int i = 0;
         // In order not to generate uncontrolled tasks, We will try again until the taskFuture is
         // completed
-        Address executionAddress;
+        Address executionAddress = getCurrentExecutionAddress();
         while (!taskFuture.isDone()
-                && nodeEngine
-                                .getClusterService()
-                                .getMember(executionAddress = getCurrentExecutionAddress())
-                        != null) {
+                && executionAddress != null
+                && nodeEngine.getClusterService().getMember(executionAddress) != null) {
             try {
                 i++;
                 log.info(
@@ -444,6 +494,15 @@ public class PhysicalVertex {
                     throw new RuntimeException(ex);
                 }
             }
+            executionAddress = getCurrentExecutionAddress();
+        }
+
+        if (!taskFuture.isDone() && ExecutionState.CANCELING.equals(getExecutionState())) {
+            log.warn(
+                    "{} cancel did not receive a terminal callback before member {} became unavailable, mark task as CANCELED locally.",
+                    taskFullName,
+                    executionAddress);
+            updateTaskState(ExecutionState.CANCELED);
         }
     }
 
@@ -451,6 +510,13 @@ public class PhysicalVertex {
         // we must update runningJobStateTimestampsIMap first and then can update
         // runningJobStateIMap
         Long[] stateTimestamps = runningJobStateTimestampsIMap.get(taskGroupLocation);
+        if (stateTimestamps == null) {
+            log.warn(
+                    "{} state timestamps have already been cleaned, skip persisting transition to {}",
+                    taskFullName,
+                    targetState);
+            return;
+        }
         stateTimestamps[targetState.ordinal()] = System.currentTimeMillis();
         runningJobStateTimestampsIMap.set(taskGroupLocation, stateTimestamps);
     }
@@ -515,6 +581,17 @@ public class PhysicalVertex {
         }
         errorByPhysicalVertex.compareAndSet(null, taskExecutionState.getThrowableMsg());
         updateTaskState(taskExecutionState.getExecutionState());
+    }
+
+    public synchronized void forceStop() {
+        ExecutionState executionState = getExecutionState();
+        if (executionState == null || executionState.isEndState()) {
+            return;
+        }
+        noticeTaskExecutionServiceCancel();
+        if (!taskFuture.isDone()) {
+            updateTaskState(ExecutionState.CANCELED);
+        }
     }
 
     public Address getCurrentExecutionAddress() {

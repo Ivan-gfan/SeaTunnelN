@@ -44,6 +44,9 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.time.DateTimeException;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -76,11 +79,41 @@ public class FixedChunkSplitter extends ChunkSplitter {
             }
         }
         if (SqlType.STRING.equals(splitKeyType.getSqlType())) {
-            log.info("useNewStringSplitter is {}", useCharsetBasedStringSplitter);
-            if (useCharsetBasedStringSplitter) {
-                return getJdbcSourceStringSplits(table, splitKeyName, splitKeyType);
-            } else {
-                return createStringColumnSplits(table, splitKeyName, splitKeyType);
+            if (config.getStringSplitStrategy() == null) {
+                log.info("useNewStringSplitter is {}", useCharsetBasedStringSplitter);
+                if (useCharsetBasedStringSplitter) {
+                    return getJdbcSourceStringSplits(table, splitKeyName, splitKeyType);
+                } else {
+                    return createStringColumnSplits(table, splitKeyName, splitKeyType);
+                }
+            }
+            switch (resolveStringSplitStrategy(table, splitKeyName)) {
+                case NONE:
+                    return Collections.singletonList(createSingleSplit(table));
+                case HASH:
+                    return createStringColumnSplits(table, splitKeyName, splitKeyType);
+                case RANGE:
+                    if (config.getStringSplitStrategy() == StringSplitStrategy.AUTO) {
+                        try {
+                            return createStringRangeSplits(table, splitKeyName, splitKeyType);
+                        } catch (Exception e) {
+                            log.warn(
+                                    "Range string split failed for table {}, fallback to hash split",
+                                    table.getTablePath(),
+                                    e);
+                            return createStringColumnSplits(table, splitKeyName, splitKeyType);
+                        }
+                    }
+                    return createStringRangeSplits(table, splitKeyName, splitKeyType);
+                case AUTO:
+                    throw new JdbcConnectorException(
+                            CommonErrorCodeDeprecated.ILLEGAL_ARGUMENT,
+                            "Unexpected string split strategy: " + config.getStringSplitStrategy());
+                default:
+                    throw new JdbcConnectorException(
+                            CommonErrorCodeDeprecated.ILLEGAL_ARGUMENT,
+                            "Unsupported string split strategy: "
+                                    + config.getStringSplitStrategy());
             }
         }
         return getJdbcSourceSplits(table, splitKeyName, splitKeyType);
@@ -169,16 +202,11 @@ public class FixedChunkSplitter extends ChunkSplitter {
     private Collection<JdbcSourceSplit> getJdbcSourceSplits(
             JdbcSourceTable table, String splitKeyName, SeaTunnelDataType splitKeyType)
             throws SQLException {
-        BigDecimal partitionStart =
-                StringUtils.isBlank(table.getPartitionStart())
-                        ? null
-                        : new BigDecimal(table.getPartitionStart());
-        BigDecimal partitionEnd =
-                StringUtils.isBlank(table.getPartitionEnd())
-                        ? null
-                        : new BigDecimal(table.getPartitionEnd());
+        BigDecimal partitionStart = parsePartitionBound(table.getPartitionStart(), splitKeyType);
+        BigDecimal partitionEnd = parsePartitionBound(table.getPartitionEnd(), splitKeyType);
         if (partitionStart == null || partitionEnd == null) {
-            Pair<BigDecimal, BigDecimal> range = findSplitColumnRange(table, splitKeyName);
+            Pair<BigDecimal, BigDecimal> range =
+                    findSplitColumnRange(table, splitKeyName, splitKeyType);
             partitionStart = range.getLeft();
             partitionEnd = range.getRight();
         }
@@ -194,15 +222,30 @@ public class FixedChunkSplitter extends ChunkSplitter {
     @Override
     protected PreparedStatement createSplitStatement(JdbcSourceSplit split, TableSchema schema)
             throws SQLException {
-        if (SqlType.STRING.equals(split.getSplitKeyType().getSqlType())
-                && !useCharsetBasedStringSplitter) {
+        if (isHashStringSplit(split)) {
             return createStringColumnSplitStatement(split);
         }
         if (split.getSplitStart() == null && split.getSplitEnd() == null) {
             return createSingleSplitStatement(split);
         }
+        if (isStringRangeSplit(split)) {
+            return createStringRangeSplitStatement(split);
+        }
 
         return createNumberColumnSplitStatement(split);
+    }
+
+    private boolean isHashStringSplit(JdbcSourceSplit split) {
+        return SqlType.STRING.equals(split.getSplitKeyType().getSqlType())
+                && split.getSplitStart() instanceof Integer
+                && split.getSplitEnd() == null;
+    }
+
+    private boolean isStringRangeSplit(JdbcSourceSplit split) {
+        return config.getStringSplitStrategy() != null
+                && SqlType.STRING.equals(split.getSplitKeyType().getSqlType())
+                && (split.getSplitStart() instanceof String
+                        || split.getSplitEnd() instanceof String);
     }
 
     private Collection<JdbcSourceSplit> createStringColumnSplits(
@@ -219,20 +262,35 @@ public class FixedChunkSplitter extends ChunkSplitter {
                 splitQuery =
                         String.format(
                                 "SELECT * FROM (%s) st_jdbc_splitter WHERE %s = ?",
-                                table.getQuery(),
+                                applyUserWhereCondition(table.getQuery()),
                                 jdbcDialect.hashModForField(
                                         column.getSourceType(),
                                         splitKeyName,
                                         table.getPartitionNumber()));
             } else {
-                splitQuery =
-                        String.format(
-                                "SELECT * FROM %s WHERE %s = ?",
-                                jdbcDialect.tableIdentifier(table.getTablePath()),
-                                jdbcDialect.hashModForField(
-                                        column.getSourceType(),
-                                        splitKeyName,
-                                        table.getPartitionNumber()));
+                if (StringUtils.isNotBlank(config.getWhereConditionClause())) {
+                    String userQuery =
+                            String.format(
+                                    "SELECT * FROM %s",
+                                    jdbcDialect.tableIdentifier(table.getTablePath()));
+                    splitQuery =
+                            String.format(
+                                    "SELECT * FROM (%s) st_jdbc_splitter WHERE %s = ?",
+                                    applyUserWhereCondition(userQuery),
+                                    jdbcDialect.hashModForField(
+                                            column.getSourceType(),
+                                            splitKeyName,
+                                            table.getPartitionNumber()));
+                } else {
+                    splitQuery =
+                            String.format(
+                                    "SELECT * FROM %s WHERE %s = ?",
+                                    jdbcDialect.tableIdentifier(table.getTablePath()),
+                                    jdbcDialect.hashModForField(
+                                            column.getSourceType(),
+                                            splitKeyName,
+                                            table.getPartitionNumber()));
+                }
             }
 
             JdbcSourceSplit split =
@@ -249,10 +307,92 @@ public class FixedChunkSplitter extends ChunkSplitter {
         return splits;
     }
 
+    private Collection<JdbcSourceSplit> createStringRangeSplits(
+            JdbcSourceTable table, String splitKeyName, SeaTunnelDataType splitKeyType)
+            throws SQLException {
+        Pair<Object, Object> splitColumnRange = queryMinMax(table, splitKeyName);
+        String min =
+                splitColumnRange.getLeft() == null ? null : splitColumnRange.getLeft().toString();
+        String max =
+                splitColumnRange.getRight() == null ? null : splitColumnRange.getRight().toString();
+        if (min == null || max == null || min.equals(max)) {
+            return Collections.singletonList(createSingleSplit(table));
+        }
+
+        String[] rangeResult = AsciiStringRangeSplitter.split(min, max, table.getPartitionNumber());
+        List<JdbcSourceSplit> splits = new ArrayList<>(rangeResult.length - 1);
+        for (int i = 0; i < rangeResult.length - 1; i++) {
+            splits.add(
+                    new JdbcSourceSplit(
+                            table.getTablePath(),
+                            createSplitId(table.getTablePath(), i),
+                            table.getQuery(),
+                            splitKeyName,
+                            splitKeyType,
+                            i == 0 ? null : rangeResult[i],
+                            i == rangeResult.length - 2 ? null : rangeResult[i + 1]));
+        }
+        return splits;
+    }
+
     private PreparedStatement createStringColumnSplitStatement(JdbcSourceSplit split)
             throws SQLException {
         PreparedStatement statement = createPreparedStatement(split.getSplitQuery());
         statement.setInt(1, (Integer) split.getSplitStart());
+        log.info("String column split - param[1]: {}", split.getSplitStart());
+        return statement;
+    }
+
+    private PreparedStatement createStringRangeSplitStatement(JdbcSourceSplit split)
+            throws SQLException {
+        String splitKeyName = jdbcDialect.quoteIdentifier(split.getSplitKeyName());
+        boolean isFirstSplit = split.getSplitStart() == null;
+        boolean isLastSplit = split.getSplitEnd() == null;
+
+        String condition;
+        if (isFirstSplit) {
+            condition = String.format("%s <= ? AND NOT (%s = ?)", splitKeyName, splitKeyName);
+        } else if (isLastSplit) {
+            condition = String.format("%s >= ?", splitKeyName);
+        } else {
+            condition =
+                    String.format(
+                            "%s >= ? AND NOT (%s = ?) AND %s <= ?",
+                            splitKeyName, splitKeyName, splitKeyName);
+        }
+
+        String splitQuery;
+        if (StringUtils.isNotBlank(split.getSplitQuery())) {
+            splitQuery =
+                    String.format(
+                            "SELECT * FROM (%s) st_jdbc_splitter WHERE %s",
+                            applyUserWhereCondition(split.getSplitQuery()), condition);
+        } else if (StringUtils.isNotBlank(config.getWhereConditionClause())) {
+            String userQuery =
+                    String.format(
+                            "SELECT * FROM %s", jdbcDialect.tableIdentifier(split.getTablePath()));
+            splitQuery =
+                    String.format(
+                            "SELECT * FROM (%s) st_jdbc_splitter WHERE %s",
+                            applyUserWhereCondition(userQuery), condition);
+        } else {
+            splitQuery =
+                    String.format(
+                            "SELECT * FROM %s WHERE %s",
+                            jdbcDialect.tableIdentifier(split.getTablePath()), condition);
+        }
+
+        PreparedStatement statement = createPreparedStatement(splitQuery);
+        if (isFirstSplit) {
+            statement.setString(1, (String) split.getSplitEnd());
+            statement.setString(2, (String) split.getSplitEnd());
+        } else if (isLastSplit) {
+            statement.setString(1, (String) split.getSplitStart());
+        } else {
+            statement.setString(1, (String) split.getSplitStart());
+            statement.setString(2, (String) split.getSplitEnd());
+            statement.setString(3, (String) split.getSplitEnd());
+        }
         return statement;
     }
 
@@ -269,6 +409,12 @@ public class FixedChunkSplitter extends ChunkSplitter {
                 jdbcNumericBetweenParametersProvider.getParameterValues();
         List<JdbcSourceSplit> splits = new ArrayList<>(table.getPartitionNumber());
         for (int i = 0; i < parameterValues.length; i++) {
+            log.info(
+                    "Number column split - params: [{}={}, {}={}]",
+                    1,
+                    parameterValues[i][0],
+                    2,
+                    parameterValues[i][1]);
             JdbcSourceSplit split =
                     new JdbcSourceSplit(
                             table.getTablePath(),
@@ -276,8 +422,8 @@ public class FixedChunkSplitter extends ChunkSplitter {
                             table.getQuery(),
                             splitKeyName,
                             splitKeyType,
-                            parameterValues[i][0],
-                            parameterValues[i][1]);
+                            convertSplitBoundary(splitKeyType, parameterValues[i][0]),
+                            convertSplitBoundary(splitKeyType, parameterValues[i][1]));
             splits.add(split);
         }
         return splits;
@@ -291,14 +437,27 @@ public class FixedChunkSplitter extends ChunkSplitter {
             splitQuery =
                     String.format(
                             "SELECT * FROM (%s) st_jdbc_splitter WHERE %s >= ? AND %s <= ?",
-                            split.getSplitQuery(), splitKeyName, splitKeyName);
-        } else {
-            splitQuery =
-                    String.format(
-                            "SELECT * FROM %s WHERE %s >= ? AND %s <= ?",
-                            jdbcDialect.tableIdentifier(split.getTablePath()),
+                            applyUserWhereCondition(split.getSplitQuery()),
                             splitKeyName,
                             splitKeyName);
+        } else {
+            if (StringUtils.isNotBlank(config.getWhereConditionClause())) {
+                String userQuery =
+                        String.format(
+                                "SELECT * FROM %s",
+                                jdbcDialect.tableIdentifier(split.getTablePath()));
+                splitQuery =
+                        String.format(
+                                "SELECT * FROM (%s) st_jdbc_splitter WHERE %s >= ? AND %s <= ?",
+                                applyUserWhereCondition(userQuery), splitKeyName, splitKeyName);
+            } else {
+                splitQuery =
+                        String.format(
+                                "SELECT * FROM %s WHERE %s >= ? AND %s <= ?",
+                                jdbcDialect.tableIdentifier(split.getTablePath()),
+                                splitKeyName,
+                                splitKeyName);
+            }
         }
         PreparedStatement statement = createPreparedStatement(splitQuery);
 
@@ -323,6 +482,8 @@ public class FixedChunkSplitter extends ChunkSplitter {
                 statement.setByte(i + 1, (Byte) param);
             } else if (param instanceof Short) {
                 statement.setShort(i + 1, (Short) param);
+            } else if (param instanceof LocalDate) {
+                statement.setDate(i + 1, Date.valueOf((LocalDate) param));
             } else if (param instanceof Date) {
                 statement.setDate(i + 1, (Date) param);
             } else if (param instanceof Time) {
@@ -360,18 +521,98 @@ public class FixedChunkSplitter extends ChunkSplitter {
         return Pair.of(((String) min), ((String) max));
     }
 
+    /** Converts temporal DATE min/max values to epoch days before numeric range arithmetic. */
     private Pair<BigDecimal, BigDecimal> findSplitColumnRange(
-            JdbcSourceTable table, String columnName) throws SQLException {
+            JdbcSourceTable table, String columnName, SeaTunnelDataType splitKeyType)
+            throws SQLException {
         Pair<Object, Object> splitColumnRange = queryMinMax(table, columnName);
         Object min = splitColumnRange.getLeft();
         Object max = splitColumnRange.getRight();
         if (min != null) {
-            min = convertToBigDecimal(min);
+            min = convertToBigDecimal(min, splitKeyType);
         }
         if (max != null) {
-            max = convertToBigDecimal(max);
+            max = convertToBigDecimal(max, splitKeyType);
         }
         return Pair.of(((BigDecimal) min), ((BigDecimal) max));
+    }
+
+    /**
+     * Parses partition bounds into the unit used by the numeric splitter.
+     *
+     * <p>DATE values use epoch days. The numeric fallback preserves compatibility with existing
+     * configurations that supplied raw epoch-day values.
+     */
+    private BigDecimal parsePartitionBound(String bound, SeaTunnelDataType splitKeyType) {
+        if (StringUtils.isBlank(bound)) {
+            return null;
+        }
+        SqlType sqlType = splitKeyType.getSqlType();
+        boolean dateSplitKey = SqlType.DATE.equals(sqlType);
+        if (SqlType.DATE.equals(sqlType)) {
+            try {
+                return BigDecimal.valueOf(LocalDate.parse(bound).toEpochDay());
+            } catch (DateTimeParseException ignored) {
+            }
+        }
+        try {
+            BigDecimal numericBound = new BigDecimal(bound);
+            if (dateSplitKey && numericBound.stripTrailingZeros().scale() > 0) {
+                throw new JdbcConnectorException(
+                        CommonErrorCodeDeprecated.ILLEGAL_ARGUMENT,
+                        "DATE partition bounds must be whole numbers: " + bound);
+            }
+            return numericBound;
+        } catch (NumberFormatException e) {
+            if (dateSplitKey) {
+                String expectedFormat = "yyyy-MM-dd or a whole epoch-day number.";
+                throw new JdbcConnectorException(
+                        CommonErrorCodeDeprecated.ILLEGAL_ARGUMENT,
+                        "Invalid "
+                                + sqlType
+                                + " partition bound '"
+                                + bound
+                                + "'. Expected "
+                                + expectedFormat,
+                        e);
+            }
+            throw e;
+        }
+    }
+
+    /** Keeps DATE split boundaries independent of JVM timezones until JDBC parameter binding. */
+    private Serializable convertSplitBoundary(
+            SeaTunnelDataType splitKeyType, Serializable splitBoundary) {
+        if (!(splitBoundary instanceof BigDecimal)) {
+            return splitBoundary;
+        }
+        BigDecimal boundary = (BigDecimal) splitBoundary;
+        if (SqlType.DATE.equals(splitKeyType.getSqlType())) {
+            try {
+                return LocalDate.ofEpochDay(boundary.longValueExact());
+            } catch (ArithmeticException | DateTimeException e) {
+                throw new JdbcConnectorException(
+                        CommonErrorCodeDeprecated.ILLEGAL_ARGUMENT,
+                        "DATE partition bound is outside the supported date range: " + boundary,
+                        e);
+            }
+        }
+        return splitBoundary;
+    }
+
+    /**
+     * Converts DATE min/max results to epoch days, including drivers returning DATE as TIMESTAMP.
+     */
+    private BigDecimal convertToBigDecimal(Object o, SeaTunnelDataType splitKeyType) {
+        if (SqlType.DATE.equals(splitKeyType.getSqlType())) {
+            if (o instanceof Date) {
+                return BigDecimal.valueOf(((Date) o).toLocalDate().toEpochDay());
+            } else if (o instanceof Timestamp) {
+                return BigDecimal.valueOf(
+                        ((Timestamp) o).toLocalDateTime().toLocalDate().toEpochDay());
+            }
+        }
+        return convertToBigDecimal(o);
     }
 
     private BigDecimal convertToBigDecimal(Object o) {

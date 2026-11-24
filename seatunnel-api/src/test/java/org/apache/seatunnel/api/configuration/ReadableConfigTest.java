@@ -29,6 +29,7 @@ import org.junit.jupiter.api.Test;
 
 import java.net.URISyntaxException;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -38,6 +39,15 @@ public class ReadableConfigTest {
     private static final String CONFIG_PATH = "/conf/option-test.conf";
     private static ReadonlyConfig config;
     private static Map<String, Object> map;
+
+    @Test
+    public void testToConfigPreservesInvalidPathKey() {
+        Map<String, Object> fields = new HashMap<>();
+        fields.put("^t_nova_.*$", "string");
+
+        Config converted = ReadonlyConfig.fromMap(fields).toConfig();
+        Assertions.assertEquals("string", converted.root().unwrapped().get("^t_nova_.*$"));
+    }
 
     @BeforeAll
     public static void prepare() throws URISyntaxException {
@@ -156,6 +166,47 @@ public class ReadableConfigTest {
                 config.get(Options.key("option.double-str").stringType().noDefaultValue()));
         Assertions.assertNull(
                 config.get(Options.key("option.not-exist").stringType().noDefaultValue()));
+    }
+
+    @Test
+    public void testDurationOption() {
+        Option<Duration> durationOption =
+                Options.key("option.duration").durationType().noDefaultValue();
+
+        Map<String, Object> optionMap = new HashMap<>();
+        optionMap.put("option.duration", "1S");
+        Assertions.assertEquals(
+                Duration.ofSeconds(1), ReadonlyConfig.fromMap(optionMap).get(durationOption));
+
+        optionMap.put("option.duration", "PT1S");
+        Assertions.assertEquals(
+                Duration.ofSeconds(1), ReadonlyConfig.fromMap(optionMap).get(durationOption));
+
+        optionMap.put("option.duration", "1s");
+        Assertions.assertEquals(
+                Duration.ofSeconds(1), ReadonlyConfig.fromMap(optionMap).get(durationOption));
+
+        ReadonlyConfig fromConfig =
+                ReadonlyConfig.fromConfig(ConfigFactory.parseString("option.duration=1S"));
+        Assertions.assertEquals(Duration.ofSeconds(1), fromConfig.get(durationOption));
+
+        ReadonlyConfig fromLowercaseConfig =
+                ReadonlyConfig.fromConfig(ConfigFactory.parseString("option.duration=\"1s\""));
+        Assertions.assertEquals(Duration.ofSeconds(1), fromLowercaseConfig.get(durationOption));
+
+        ReadonlyConfig fromIsoConfig =
+                ReadonlyConfig.fromConfig(ConfigFactory.parseString("option.duration=\"PT1S\""));
+        Assertions.assertEquals(Duration.ofSeconds(1), fromIsoConfig.get(durationOption));
+
+        optionMap.put("option.duration", "bad_duration");
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ReadonlyConfig.fromMap(optionMap).get(durationOption));
+
+        optionMap.put("option.duration", "PT7D");
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ReadonlyConfig.fromMap(optionMap).get(durationOption));
     }
 
     @Test

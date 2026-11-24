@@ -1,10 +1,10 @@
-# JsonPath
+# JSON 路径提取
 
-> JSONPath 转换插件
+> JsonPath：使用 JSONPath 从 JSON 数据中提取字段
 
 ## 描述
 
-> 支持使用 JSONPath 选择数据
+JsonPath 转换插件支持使用 JSONPath 选择数据。
 
 ## 属性
 
@@ -13,7 +13,7 @@
 | columns              | Array | Yes  |      | 
 | row_error_handle_way | Enum  | No   | FAIL |
 
-### common options [string]
+### 通用选项 [string]
 
 转换插件的常见参数, 请参考  [Transform Plugin](common-options/common-options.md) 了解详情
 
@@ -23,18 +23,23 @@
 
 - FAIL：选择`FAIL`时，数据格式错误会阻塞并抛出异常。
 - SKIP：选择`SKIP`时，数据格式错误会跳过该行数据。
+- ROUTE_TO_TABLE：JsonPath 转换尚未实现该处理方式。该值目前可以配置，但实际行为与 `FAIL` 完全相同：解析失败的行会直接使作业失败，不会被路由到错误表。
+
+未配置列级策略时，此选项适用于路径读取错误和已识别的数据转换失败。
+JsonPath 不支持 `ROUTE_TO_TABLE`：不会路由错误，为失败值选择此策略时会抛出异常。
+策略优先级和示例见[配置异常数据处理策略](#配置异常数据处理策略)。
 
 ### columns [array]
 
 #### 属性
 
-| 名称                      | 类型     | 是否必须 | 默认值    |
-|-------------------------|--------|------|--------|
-| src_field               | String | Yes  |        |
-| dest_field              | String | Yes  |        |
-| path                    | String | Yes  |        |
-| dest_type               | String | No   | String |
-| column_error_handle_way | Enum   | No   |        |
+| 名称                      | 类型              | 是否必须 | 默认值    |
+|-------------------------|-----------------|------|--------|
+| src_field               | String          | Yes  |        |
+| dest_field              | String or Array | Yes  |        |
+| path                    | String or Array | Yes  |        |
+| dest_type               | String or Array | No   | String |
+| column_error_handle_way | Enum            | No   |        |
 
 #### src_field
 
@@ -52,13 +57,19 @@
 
 > 使用 JSONPath 后的输出字段
 
+可以是单个字段名；当需要从同一个源字段提取多个值时，也可以配置为字段名数组。
+
 #### dest_type
 
 > 目标字段的类型
 
+可以是单个类型；也可以在批量提取时配置为类型数组。单字段提取时如果省略，默认使用 `string`。
+
 #### path
 
 > Jsonpath
+
+可以是单个 JSONPath 表达式，也可以是 JSONPath 表达式数组。
 
 #### column_error_handle_way [Enum]
 
@@ -67,6 +78,10 @@
 - FAIL：选择`FAIL`时，数据格式错误会阻塞并抛出异常。
 - SKIP：选择`SKIP`时，数据格式错误会跳过此列数据。
 - SKIP_ROW：选择`SKIP_ROW`时，数据格式错误会跳过此行数据。
+
+这些策略也适用于已识别的数据转换失败，例如无效的日期或数字。
+列级 `SKIP` 将目标字段设为 `null`，不会丢弃整行。不支持 `ROUTE_TO_TABLE`。
+策略优先级和限制见[配置异常数据处理策略](#配置异常数据处理策略)。
 
 ## 读取 JSON 示例
 
@@ -91,7 +106,7 @@
 
 假设我们想要使用 JsonPath 提取属性。
 
-```json
+```hocon
 transform {
   JsonPath {
     plugin_input = "fake"
@@ -179,13 +194,13 @@ transform {
   }
 }
 ```
-**重要提示：** 当使用批量字段提取（多个 paths、dest_fields 和 dest_types）时，`dest_type` 参数是必填的，不能省略。每个提取的字段都必须指定一个对应的类型。数组格式提供了更好的可读性，比基于字符串的配置更不容易出错。
+**重要提示：** 使用批量字段提取时，`path`、`dest_field` 和 `dest_type` 的数组长度必须一致。如果省略 `dest_type`，Transform 只会使用单个默认类型 `string`，因此多个输出字段应显式配置 `dest_type` 数组。
 
 那么数据结果表 `fake1` 将会像这样
 
-|             data             |    c1_string     | c1_boolean | c1_integer | c1_float | c1_double | c1_decimal |  c1_date   | c1_datetime  |          c1_array           |
-|------------------------------|------------------|------------|------------|----------|-----------|------------|------------|--------------|-----------------------------|
-| too much content not to show | this is a string | true       | 42         | 3.14     | 3.14      | 10.55      | 2023-10-29 | 16:12:43.459 | ["item1", "item2", "item3"] |
+|             data             |    c1_string     | c1_boolean | c1_integer | c1_float | c1_double | c1_decimal |  c1_date   | c1_datetime  |          c1_array           |         c1_map_array         |
+|------------------------------|------------------|------------|------------|----------|-----------|------------|------------|--------------|-----------------------------|------------------------------|
+| too much content not to show | this is a string | true       | 42         | 3.14     | 3.14      | 10.55      | 2023-10-29 | 16:12:43.459 | ["item1", "item2", "item3"] | [{"c_string_1": "c_string_1", "c_string_2": "c_string_2", "c_string_3": "c_string_3"}, {"c_string_1": "c_string_1", "c_string_2": "c_string_2", "c_string_3": "c_string_3"}] |
 
 ## 读取 SeatunnelRow 示例
 
@@ -226,9 +241,9 @@ transform {
 
 那么数据结果表 `fake1` 将会像这样:
 
-| name | age |   col    | other |
-|------|-----|----------|-------|
-| a    | 18  | ["a",18] | ...   |
+|   col    | other | name | age |
+|----------|-------|------|-----|
+| ["a",18] | ...   | a    | 18  |
 
 
 
@@ -236,7 +251,43 @@ transform {
 
 您可以配置 `row_error_handle_way` 与 `column_error_handle_way` 来处理异常数据，两者都是非必填项。
 
-`row_error_handle_way` 配置对行数据内所有数据异常进行处理，`column_error_handle_way` 配置对某列数据异常进行处理，优先级高于 `row_error_handle_way`。
+这些策略适用于路径读取错误和已识别的值转换失败（数字、日期/时间、二进制数据及其嵌套转换）。
+列级 `SKIP` 将失败的目标字段设为 `null` 并继续处理其他列；列级 `SKIP_ROW` 丢弃整行。
+未配置列级策略时，使用行级 `FAIL` 或 `SKIP`。显式列级策略优先，因此即使行级策略为
+`SKIP`，列级 `FAIL` 仍会失败。此转换不支持 `ROUTE_TO_TABLE`，为失败值选择该策略时
+会传播异常，而不是路由记录。
+
+不支持的转换、意外的程序/配置错误和致命 JVM 错误会使任务失败，不会被跳过。
+已识别的转换失败使用 `JSONPATH_ERROR_CODE-07`，诊断包含安全的源/目标字段标识符、目标 SQL 类型
+及通用的 `data conversion failure` 类别，而不是按原因类型细分的类别。
+无效的 `float_vector` 结构及非数值向量元素目前使用共享转换器的不支持类型错误，不能由这些策略跳过。
+转换异常和跳过日志不包含源记录、提取值、路径表达式或可能携带隐私数据的原始异常；
+配置路径中的字面量也可能包含隐私数据。路径读取错误诊断及跳过日志仅包含安全的源/目标字段标识符
+和异常类型；不符合 `[A-Za-z_][A-Za-z0-9_]{0,63}` 的字段标识符显示为 `<redacted>`。
+从零开始的 `column_index` 表示展开后的输出字段位置，包括由同一 `columns` 配置项中的数组展开的字段，
+即使字段名被隐藏也能用于定位。
+源 JSON、配置路径和原始异常消息均不会包含在这些诊断中。`FAIL` 时，
+`ErrorDataTransformException` 附加经过净化的 `JsonPathException` cause，而不是原始异常：
+保留原始消息或堆栈可能重新暴露输入数据或私有路径字面量。这样保留了 cause 链，
+但不保留原始 cause 的子类型和堆栈细节。无效的配置路径即使在 `SKIP` 下也会以经过净化的
+异常使任务失败。意外失败仍会传播。
+
+### 跳过无法转换的值
+
+当 `json_data` 中的输入为 `{"amount":"invalid","description":"retained"}` 时，
+以下配置将 `amount` 设为 null，并保留 `description`：
+
+```hocon
+transform {
+  JsonPath {
+    row_error_handle_way = FAIL
+    columns = [
+      { src_field = "json_data", path = "$.amount", dest_field = "amount", dest_type = "int", column_error_handle_way = SKIP },
+      { src_field = "json_data", path = "$.description", dest_field = "description", dest_type = "string" }
+    ]
+  }
+}
+```
 
 ### 跳过异常数据行
 
@@ -323,4 +374,3 @@ transform {
 ## 更新日志
 
 * 添加 JsonPath 转换
-

@@ -17,11 +17,14 @@
 
 package org.apache.seatunnel.transform.sql.zeta.functions;
 
+import org.apache.seatunnel.common.exception.CommonError;
 import org.apache.seatunnel.common.exception.CommonErrorCodeDeprecated;
 import org.apache.seatunnel.transform.exception.TransformException;
+import org.apache.seatunnel.transform.sql.zeta.ZetaDateTimeFormat;
 import org.apache.seatunnel.transform.sql.zeta.ZetaSQLFunction;
 
 import java.text.DateFormatSymbols;
+import java.time.DateTimeException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -31,16 +34,40 @@ import java.time.OffsetDateTime;
 import java.time.Period;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.time.temporal.Temporal;
 import java.time.temporal.TemporalAccessor;
 import java.time.temporal.WeekFields;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class DateTimeFunction {
     /** English names of months and week days. */
     private static volatile String[][] MONTHS_AND_WEEKS;
+
+    // 1024 is far beyond the number of distinct date patterns in real-world SQL
+    // (typically low tens). The cap bounds retained memory; no eviction needed
+    // because the cache never fills in practice.
+    private static final int FORMATTER_CACHE_MAX_SIZE = 1024;
+
+    private static final Map<String, DateTimeFormatter> FORMATTER_CACHE =
+            new ConcurrentHashMap<>(FORMATTER_CACHE_MAX_SIZE);
+
+    private static DateTimeFormatter getFormatter(String pattern) {
+        DateTimeFormatter cached = FORMATTER_CACHE.get(pattern);
+        if (cached != null) {
+            return cached;
+        }
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(pattern, Locale.ENGLISH);
+        if (FORMATTER_CACHE.size() < FORMATTER_CACHE_MAX_SIZE) {
+            FORMATTER_CACHE.putIfAbsent(pattern, formatter);
+        }
+        return formatter;
+    }
 
     public static LocalDate currentDate() {
         return LocalDate.now();
@@ -64,7 +91,7 @@ public class DateTimeFunction {
         if (args.size() >= 3) {
             String df = (String) args.get(2);
             if (df != null) {
-                datetimeField = df.toUpperCase();
+                datetimeField = df.toUpperCase(Locale.ROOT);
             }
         }
         switch (datetimeField) {
@@ -75,6 +102,9 @@ public class DateTimeFunction {
                 if (datetime instanceof LocalDateTime) {
                     return ((LocalDateTime) datetime).plusYears(count);
                 }
+                if (datetime instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) datetime).plusYears(count);
+                }
                 break;
             case "MONTH":
                 if (datetime instanceof LocalDate) {
@@ -82,6 +112,9 @@ public class DateTimeFunction {
                 }
                 if (datetime instanceof LocalDateTime) {
                     return ((LocalDateTime) datetime).plusMonths(count);
+                }
+                if (datetime instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) datetime).plusMonths(count);
                 }
                 break;
             case "WEEK":
@@ -91,6 +124,9 @@ public class DateTimeFunction {
                 if (datetime instanceof LocalDateTime) {
                     return ((LocalDateTime) datetime).plusWeeks(count);
                 }
+                if (datetime instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) datetime).plusWeeks(count);
+                }
                 break;
             case "DAY":
                 if (datetime instanceof LocalDate) {
@@ -98,6 +134,9 @@ public class DateTimeFunction {
                 }
                 if (datetime instanceof LocalDateTime) {
                     return ((LocalDateTime) datetime).plusDays(count);
+                }
+                if (datetime instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) datetime).plusDays(count);
                 }
                 break;
             case "HOUR":
@@ -107,6 +146,9 @@ public class DateTimeFunction {
                 if (datetime instanceof LocalDateTime) {
                     return ((LocalDateTime) datetime).plusHours(count);
                 }
+                if (datetime instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) datetime).plusHours(count);
+                }
                 break;
             case "MINUTE":
                 if (datetime instanceof LocalTime) {
@@ -114,6 +156,9 @@ public class DateTimeFunction {
                 }
                 if (datetime instanceof LocalDateTime) {
                     return ((LocalDateTime) datetime).plusMinutes(count);
+                }
+                if (datetime instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) datetime).plusMinutes(count);
                 }
                 break;
             case "SECOND":
@@ -123,6 +168,9 @@ public class DateTimeFunction {
                 if (datetime instanceof LocalDateTime) {
                     return ((LocalDateTime) datetime).plusSeconds(count);
                 }
+                if (datetime instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) datetime).plusSeconds(count);
+                }
                 break;
             case "MILLISECOND":
                 if (datetime instanceof LocalTime) {
@@ -130,6 +178,9 @@ public class DateTimeFunction {
                 }
                 if (datetime instanceof LocalDateTime) {
                     return ((LocalDateTime) datetime).plusNanos(count * 1000_000L);
+                }
+                if (datetime instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) datetime).plusNanos(count * 1000_000L);
                 }
                 break;
             default:
@@ -155,7 +206,7 @@ public class DateTimeFunction {
         if (args.size() >= 3) {
             String df = (String) args.get(2);
             if (df != null) {
-                datetimeField = df.toUpperCase();
+                datetimeField = df.toUpperCase(Locale.ROOT);
             }
         }
 
@@ -166,14 +217,16 @@ public class DateTimeFunction {
                 || "DAY".equals(datetimeField)) {
             if (datetime1 instanceof LocalDateTime) {
                 date1 = ((LocalDateTime) datetime1).toLocalDate();
-            }
-            if (datetime1 instanceof LocalDate) {
+            } else if (datetime1 instanceof OffsetDateTime) {
+                date1 = ((OffsetDateTime) datetime1).toLocalDate();
+            } else if (datetime1 instanceof LocalDate) {
                 date1 = (LocalDate) datetime1;
             }
             if (datetime2 instanceof LocalDateTime) {
                 date2 = ((LocalDateTime) datetime2).toLocalDate();
-            }
-            if (datetime2 instanceof LocalDate) {
+            } else if (datetime2 instanceof OffsetDateTime) {
+                date2 = ((OffsetDateTime) datetime2).toLocalDate();
+            } else if (datetime2 instanceof LocalDate) {
                 date2 = (LocalDate) datetime2;
             }
         }
@@ -220,15 +273,19 @@ public class DateTimeFunction {
     }
 
     public static LocalDateTime dateTrunc(List<Object> args) {
-        LocalDateTime datetime = (LocalDateTime) args.get(0);
-        if (datetime == null) {
+        Object raw = args.get(0);
+        if (raw == null) {
             return null;
         }
+        LocalDateTime datetime =
+                raw instanceof OffsetDateTime
+                        ? ((OffsetDateTime) raw).toLocalDateTime()
+                        : (LocalDateTime) raw;
         String datetimeField = "DAY";
         if (args.size() >= 2) {
             String df = (String) args.get(1);
             if (df != null) {
-                datetimeField = df.toUpperCase();
+                datetimeField = df.toUpperCase(Locale.ROOT);
             }
         }
         int year = datetime.getYear();
@@ -307,6 +364,8 @@ public class DateTimeFunction {
         LocalDate localDate = null;
         if (datetime instanceof LocalDateTime) {
             localDate = ((LocalDateTime) datetime).toLocalDate();
+        } else if (datetime instanceof OffsetDateTime) {
+            localDate = ((OffsetDateTime) datetime).toLocalDate();
         } else if (datetime instanceof LocalDate) {
             localDate = (LocalDate) datetime;
         }
@@ -346,7 +405,7 @@ public class DateTimeFunction {
             return null;
         }
         String datetimeField = (String) args.get(1);
-        switch (datetimeField.toUpperCase()) {
+        switch (datetimeField.toUpperCase(Locale.ROOT)) {
             case "YEAR":
                 if (datetime instanceof LocalDate) {
                     return ((LocalDate) datetime).getYear();
@@ -518,6 +577,9 @@ public class DateTimeFunction {
                 if (datetime instanceof LocalDateTime) {
                     return ((LocalDateTime) datetime).getDayOfWeek().getValue();
                 }
+                if (datetime instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) datetime).getDayOfWeek().getValue();
+                }
                 break;
             case "DOY":
             case "DAYOFYEAR":
@@ -540,6 +602,10 @@ public class DateTimeFunction {
                     LocalDate date = ((LocalDateTime) datetime).toLocalDate();
                     return date.get(WeekFields.ISO.weekBasedYear());
                 }
+                if (datetime instanceof OffsetDateTime) {
+                    LocalDate date = ((OffsetDateTime) datetime).toLocalDate();
+                    return date.get(WeekFields.ISO.weekBasedYear());
+                }
                 break;
             case "MILLENNIUM":
                 if (datetime instanceof LocalDate) {
@@ -548,6 +614,10 @@ public class DateTimeFunction {
                 }
                 if (datetime instanceof LocalDateTime) {
                     int year = ((LocalDateTime) datetime).getYear();
+                    return (year > 0) ? (year - 1) / 1000 + 1 : year / 1000;
+                }
+                if (datetime instanceof OffsetDateTime) {
+                    int year = ((OffsetDateTime) datetime).getYear();
                     return (year > 0) ? (year - 1) / 1000 + 1 : year / 1000;
                 }
                 break;
@@ -584,6 +654,8 @@ public class DateTimeFunction {
         LocalTime localTime = null;
         if (datetime instanceof LocalDateTime) {
             localTime = ((LocalDateTime) datetime).toLocalTime();
+        } else if (datetime instanceof OffsetDateTime) {
+            localTime = ((OffsetDateTime) datetime).toLocalTime();
         } else if (datetime instanceof LocalTime) {
             localTime = (LocalTime) datetime;
         }
@@ -619,10 +691,38 @@ public class DateTimeFunction {
     }
 
     public static boolean isDate(List<Object> args) {
+        String str = (String) args.get(0);
+        if (str == null || str.isEmpty()) {
+            return false;
+        }
+
+        String format = (String) args.get(1);
+        if (format == null) {
+            return false;
+        }
+
+        ZetaDateTimeFormat dateTimeFormat = ZetaDateTimeFormat.fromPattern(format).orElse(null);
+        if (dateTimeFormat == null) {
+            return false;
+        }
+
         try {
-            parsedatetime(args);
-            return true;
-        } catch (Throwable e) {
+            DateTimeFormatter formatter = dateTimeFormat.getFormatter();
+
+            switch (dateTimeFormat.getType()) {
+                case DATETIME:
+                    LocalDateTime.parse(str, formatter);
+                    return true;
+                case DATE:
+                    LocalDate.parse(str, formatter);
+                    return true;
+                case TIME:
+                    LocalTime.parse(str, formatter);
+                    return true;
+                default:
+                    return false;
+            }
+        } catch (DateTimeParseException e) {
             return false;
         }
     }
@@ -633,23 +733,32 @@ public class DateTimeFunction {
             return null;
         }
         String format = (String) args.get(1);
-        if (format.contains("yy") && format.contains("mm")) {
-            DateTimeFormatter df = DateTimeFormatter.ofPattern(format);
-            return LocalDateTime.parse(str, df);
+
+        ZetaDateTimeFormat dateTimeFormat =
+                ZetaDateTimeFormat.fromPattern(format)
+                        .orElseThrow(
+                                () ->
+                                        CommonError.illegalArgument(
+                                                format, "unsupported datetime format"));
+
+        try {
+            DateTimeFormatter formatter = dateTimeFormat.getFormatter();
+
+            switch (dateTimeFormat.getType()) {
+                case DATETIME:
+                    return LocalDateTime.parse(str, formatter);
+                case DATE:
+                    return LocalDate.parse(str, formatter);
+                case TIME:
+                    return LocalTime.parse(str, formatter);
+                default:
+                    throw CommonError.illegalArgument(
+                            dateTimeFormat.getType().toString(),
+                            "unsupported datetime format type");
+            }
+        } catch (DateTimeParseException e) {
+            throw CommonError.illegalArgument(str, "parsing datetime with format: " + format);
         }
-        if (format.contains("yy")) {
-            DateTimeFormatter df = DateTimeFormatter.ofPattern(format);
-            return LocalDate.parse(str, df);
-        }
-        if (format.contains("mm")) {
-            DateTimeFormatter df = DateTimeFormatter.ofPattern(format);
-            return LocalTime.parse(str, df);
-        }
-        throw new TransformException(
-                CommonErrorCodeDeprecated.UNSUPPORTED_OPERATION,
-                String.format(
-                        "Unknown pattern letter %s for function: %s",
-                        format, ZetaSQLFunction.PARSEDATETIME));
     }
 
     public static Integer quarter(List<Object> args) {
@@ -711,9 +820,114 @@ public class DateTimeFunction {
             String timeZone = (String) args.get(2);
             zoneId = ZoneId.of(timeZone);
         }
-        DateTimeFormatter df = DateTimeFormatter.ofPattern(format);
+        DateTimeFormatter df = getFormatter(format);
         LocalDateTime datetime = Instant.ofEpochSecond(unixTime).atZone(zoneId).toLocalDateTime();
         return df.format(datetime);
+    }
+
+    /**
+     * Converts a datetime to Unix epoch seconds, the inverse of {@link #fromUnixTime}.
+     *
+     * <p>Supported forms:
+     *
+     * <ul>
+     *   <li>no argument — current epoch seconds ({@code UNIX_TIMESTAMP()});
+     *   <li>a typed datetime argument ({@code OffsetDateTime} / {@code LocalDateTime} / {@code
+     *       LocalDate});
+     *   <li>a string parsed with an optional pattern (default {@code yyyy-MM-dd HH:mm:ss}).
+     * </ul>
+     *
+     * <p>{@code LocalDateTime} / {@code LocalDate} and string inputs without a zone offset are
+     * resolved against the system default time zone (the inverse of {@link #fromUnixTime}); {@code
+     * OffsetDateTime} and strings whose pattern carries an offset use that offset. Unparseable
+     * string input returns {@code null} rather than raising. An explicit {@code null} pattern or an
+     * invalid pattern string returns {@code null} for all input types. The {@code pattern} argument
+     * is only consulted for string input. Numeric input is not supported and returns {@code null};
+     * other non-temporal types (for example {@code LocalTime}, {@code Boolean}, {@code byte[]})
+     * raise a {@link TransformException}. An out-of-range day-of-month (for example {@code
+     * 2023-02-30}) is adjusted to the last valid day of that month by the SMART resolver,
+     * consistent with the other date functions in this class.
+     */
+    public static Long unixTimestamp(List<Object> args) {
+        // UNIX_TIMESTAMP() — current epoch seconds
+        if (args.isEmpty()) {
+            return Instant.now().getEpochSecond();
+        }
+        Object value = args.get(0);
+        if (value == null) {
+            return null;
+        }
+
+        // Resolve and validate the pattern argument before the type dispatch so that
+        // an explicit NULL pattern or an invalid pattern returns NULL consistently for
+        // all input types, not only for string input.
+        DateTimeFormatter formatter = null;
+        if (args.size() >= 2) {
+            Object patternArg = args.get(1);
+            if (patternArg == null) {
+                return null;
+            }
+            String pattern = patternArg.toString();
+            try {
+                formatter = getFormatter(pattern);
+            } catch (IllegalArgumentException e) {
+                // An invalid pattern returns NULL rather than raising, so a bad
+                // pattern value (including one sourced from a row column) does not
+                // fail the query.
+                return null;
+            }
+        }
+
+        // UNIX_TIMESTAMP(dateTime) — typed datetime argument; pattern not consulted
+        if (value instanceof OffsetDateTime) {
+            return ((OffsetDateTime) value).toEpochSecond();
+        }
+        if (value instanceof LocalDateTime) {
+            return ((LocalDateTime) value).atZone(ZoneId.systemDefault()).toEpochSecond();
+        }
+        if (value instanceof LocalDate) {
+            return ((LocalDate) value).atStartOfDay(ZoneId.systemDefault()).toEpochSecond();
+        }
+
+        // Numeric input is not supported and returns NULL (documented behaviour);
+        // other non-temporal types raise so a schema/type mistake is not silent.
+        if (value instanceof Number) {
+            return null;
+        }
+        if (!(value instanceof String)) {
+            throw new TransformException(
+                    CommonErrorCodeDeprecated.UNSUPPORTED_OPERATION,
+                    String.format(
+                            "Unsupported type %s for function: UNIX_TIMESTAMP", value.getClass()));
+        }
+
+        // UNIX_TIMESTAMP(string[, pattern]) — string parsed to epoch seconds
+        String str = (String) value;
+        if (formatter == null) {
+            formatter = getFormatter("yyyy-MM-dd HH:mm:ss");
+        }
+        try {
+            TemporalAccessor parsed =
+                    formatter.parseBest(
+                            str,
+                            ZonedDateTime::from,
+                            OffsetDateTime::from,
+                            LocalDateTime::from,
+                            LocalDate::from);
+            if (parsed instanceof ZonedDateTime) {
+                return ((ZonedDateTime) parsed).toEpochSecond();
+            }
+            if (parsed instanceof OffsetDateTime) {
+                return ((OffsetDateTime) parsed).toEpochSecond();
+            }
+            if (parsed instanceof LocalDateTime) {
+                return ((LocalDateTime) parsed).atZone(ZoneId.systemDefault()).toEpochSecond();
+            }
+            return ((LocalDate) parsed).atStartOfDay(ZoneId.systemDefault()).toEpochSecond();
+        } catch (DateTimeException e) {
+            // Unparseable input returns NULL rather than throwing
+            return null;
+        }
     }
 
     public static OffsetDateTime atTimeZone(TemporalAccessor datetime, Object timeZone) {

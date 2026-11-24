@@ -6,19 +6,33 @@ sidebar_position: 4
 
 > Common parameters of sink connectors
 
+For sink write mode selection, automatic SQL generation, `schema_save_mode`, `data_save_mode`,
+`custom_sql`, and `enable_upsert`, see [Sink Write Modes and Save Modes](sink-write-modes.md).
+
 :::caution warn
 
 The old configuration name `source_table_name` is deprecated, please migrate to the new name `plugin_input` as soon as possible.
 
 :::
 
-| Name         | Type   | Required | Default | Description                                                                                                                                                                                                                                                                |
-|--------------|--------|----------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| plugin_input | String | No       | -       | When `plugin_input` is not specified, the current plug-in processes the data set `dataset` output by the previous plugin in the configuration file <br/> When `plugin_input` is specified, the current plug-in is processing the data set corresponding to this parameter. |
+| Name          | Type   | Required | Default | Description                                                                                                                                                                                                                                                                                                                                  |
+|---------------|--------|----------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| plugin_input  | list   | No       | -       | When `plugin_input` is not specified, the current plug-in processes the data set `dataset` output by the previous plugin in the configuration file <br/> When `plugin_input` is specified, the current plug-in processes the data set corresponding to this parameter. The value can be a single upstream dataset name or an array of names; with several names the Zeta engine unions those upstream data sets into this sink. |
+| metadata_datasource_id | String | No       | -       | The data source ID for retrieving connection configuration from Metadata Center. When specified, the connector will fetch connection details (e.g., URL, username, password) from the external metadata service instead of using direct configuration. See [Metadata SPI](../../introduction/concepts/metadata-spi.md) for more information. |
+
+### plugin_input [list]
+
+When `plugin_input` is not specified, the current plug-in processes the data set `dataset` output by the previous plugin in the configuration file.
+
+When `plugin_input` is specified, the current plug-in processes the data set corresponding to this parameter. The value can be a single upstream dataset name (a string) or an array of names.
+
+### metadata_datasource_id [string]
+
+The data source ID for retrieving connection configuration from Metadata Center. When specified, the connector will fetch connection details (e.g., URL, username, password) from the external metadata service instead of using direct configuration. See [Metadata SPI](../../introduction/concepts/metadata-spi.md) for more information.
 
 # Important note
 
-When the job configuration `plugin_input` you must set the `plugin_output` parameter
+A sink only consumes data sets, so it has no `plugin_output` option. The `plugin_input` value must match the `plugin_output` declared by an upstream source or transform. `plugin_input` is only mandatory when the job has more than one source, transform or sink (see the note at the end of this page).
 
 ## Task Example
 
@@ -28,10 +42,15 @@ When the job configuration `plugin_input` you must set the `plugin_output` param
 
 ```bash
 source {
-    FakeSourceStream {
+    FakeSource {
       parallelism = 2
       plugin_output = "fake"
-      field_name = "name,age"
+      schema = {
+        fields {
+          name = "string"
+          age = "int"
+        }
+      }
     }
 }
 
@@ -60,4 +79,3 @@ sink {
 
 > If the job only have one source and one(or zero) transform and one sink, You do not need to specify `plugin_input` and `plugin_output` for connector.
 > If the number of any operator in source, transform and sink is greater than 1, you must specify the `plugin_input` and `plugin_output` for each connector in the job.
-

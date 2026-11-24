@@ -71,8 +71,7 @@ class JobHistoryServiceTest extends AbstractSeaTunnelServerTest {
                         });
 
         // waiting for JOB_1 status turn to FINISHED
-        await().pollDelay(5, TimeUnit.SECONDS)
-                .atMost(60000, TimeUnit.MILLISECONDS)
+        await().atMost(60000, TimeUnit.MILLISECONDS)
                 .untilAsserted(
                         () -> {
                             List<JobStatusData> jobStatusData = listJob();
@@ -147,6 +146,31 @@ class JobHistoryServiceTest extends AbstractSeaTunnelServerTest {
                                                         .getJobHistoryService()
                                                         .getJobDetailStateAsString(JOB_3)
                                                         .contains("FINISHED")));
+    }
+
+    @Test
+    void testFinishedJobCountsMatchHistory() {
+        long jobId = System.currentTimeMillis() + 10L;
+        startJob(jobId, "fake_to_console.conf");
+        await().atMost(60, TimeUnit.SECONDS)
+                .untilAsserted(
+                        () -> {
+                            long listed =
+                                    listJob().stream()
+                                            .filter(job -> job.getJobStatus() == JobStatus.FINISHED)
+                                            .count();
+                            Assertions.assertEquals(
+                                    JobStatus.FINISHED,
+                                    server.getCoordinatorService()
+                                            .getJobHistoryService()
+                                            .getJobDetailState(jobId)
+                                            .getJobStatus());
+                            Assertions.assertEquals(
+                                    listed,
+                                    server.getCoordinatorService()
+                                            .getJobCountMetrics()
+                                            .getFinishedJobCount());
+                        });
     }
 
     private void startJob(Long jobid, String path) {

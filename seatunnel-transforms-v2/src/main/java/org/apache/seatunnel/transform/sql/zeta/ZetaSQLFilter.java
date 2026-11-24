@@ -22,6 +22,7 @@ import org.apache.seatunnel.shade.org.apache.commons.lang3.tuple.Pair;
 import org.apache.seatunnel.api.table.type.BasicType;
 import org.apache.seatunnel.common.exception.CommonErrorCodeDeprecated;
 import org.apache.seatunnel.transform.exception.TransformException;
+import org.apache.seatunnel.transform.sql.zeta.functions.NumericFunction;
 
 import net.sf.jsqlparser.expression.Expression;
 import net.sf.jsqlparser.expression.Function;
@@ -41,9 +42,11 @@ import net.sf.jsqlparser.expression.operators.relational.NotEqualsTo;
 import net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList;
 import net.sf.jsqlparser.schema.Column;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -153,7 +156,18 @@ public class ZetaSQLFilter {
             }
             if (leftValue != null) {
                 if (leftValue instanceof Number && rightValue instanceof Number) {
-                    if (((Number) leftValue).doubleValue() == ((Number) rightValue).doubleValue()) {
+                    boolean equal =
+                            areExactNumbers(leftValue, rightValue)
+                                    ? compareExactNumbers((Number) leftValue, (Number) rightValue)
+                                            == 0
+                                    : ((Number) leftValue).doubleValue()
+                                            == ((Number) rightValue).doubleValue();
+                    if (equal) {
+                        return !inExpression.isNot();
+                    }
+                } else if (leftValue instanceof OffsetDateTime
+                        && rightValue instanceof OffsetDateTime) {
+                    if (((OffsetDateTime) leftValue).isEqual((OffsetDateTime) rightValue)) {
                         return !inExpression.isNot();
                     }
                 } else if (leftValue.equals(rightValue)) {
@@ -271,7 +285,12 @@ public class ZetaSQLFilter {
             return false;
         }
         if (leftVal instanceof Number && rightVal instanceof Number) {
-            return ((Number) leftVal).doubleValue() == ((Number) rightVal).doubleValue();
+            return areExactNumbers(leftVal, rightVal)
+                    ? compareExactNumbers((Number) leftVal, (Number) rightVal) == 0
+                    : ((Number) leftVal).doubleValue() == ((Number) rightVal).doubleValue();
+        }
+        if (leftVal instanceof OffsetDateTime && rightVal instanceof OffsetDateTime) {
+            return ((OffsetDateTime) leftVal).isEqual((OffsetDateTime) rightVal);
         }
         return leftVal.equals(rightVal);
     }
@@ -283,7 +302,12 @@ public class ZetaSQLFilter {
             return rightVal != null;
         }
         if (leftVal instanceof Number && rightVal instanceof Number) {
-            return ((Number) leftVal).doubleValue() != ((Number) rightVal).doubleValue();
+            return areExactNumbers(leftVal, rightVal)
+                    ? compareExactNumbers((Number) leftVal, (Number) rightVal) != 0
+                    : ((Number) leftVal).doubleValue() != ((Number) rightVal).doubleValue();
+        }
+        if (leftVal instanceof OffsetDateTime && rightVal instanceof OffsetDateTime) {
+            return !((OffsetDateTime) leftVal).isEqual((OffsetDateTime) rightVal);
         }
         return !leftVal.equals(rightVal);
     }
@@ -295,10 +319,15 @@ public class ZetaSQLFilter {
             return false;
         }
         if (leftVal instanceof Number && rightVal instanceof Number) {
-            return ((Number) leftVal).doubleValue() > ((Number) rightVal).doubleValue();
+            return areExactNumbers(leftVal, rightVal)
+                    ? compareExactNumbers((Number) leftVal, (Number) rightVal) > 0
+                    : ((Number) leftVal).doubleValue() > ((Number) rightVal).doubleValue();
         }
         if (leftVal instanceof String && rightVal instanceof String) {
             return ((String) leftVal).compareTo((String) rightVal) > 0;
+        }
+        if (leftVal instanceof OffsetDateTime && rightVal instanceof OffsetDateTime) {
+            return ((OffsetDateTime) leftVal).isAfter((OffsetDateTime) rightVal);
         }
         if (leftVal instanceof LocalDateTime && rightVal instanceof LocalDateTime) {
             return ((LocalDateTime) leftVal).isAfter((LocalDateTime) rightVal);
@@ -323,10 +352,16 @@ public class ZetaSQLFilter {
             return false;
         }
         if (leftVal instanceof Number && rightVal instanceof Number) {
-            return ((Number) leftVal).doubleValue() >= ((Number) rightVal).doubleValue();
+            return areExactNumbers(leftVal, rightVal)
+                    ? compareExactNumbers((Number) leftVal, (Number) rightVal) >= 0
+                    : ((Number) leftVal).doubleValue() >= ((Number) rightVal).doubleValue();
         }
         if (leftVal instanceof String && rightVal instanceof String) {
             return ((String) leftVal).compareTo((String) rightVal) >= 0;
+        }
+        if (leftVal instanceof OffsetDateTime && rightVal instanceof OffsetDateTime) {
+            return ((OffsetDateTime) leftVal).isAfter((OffsetDateTime) rightVal)
+                    || ((OffsetDateTime) leftVal).isEqual((OffsetDateTime) rightVal);
         }
         if (leftVal instanceof LocalDateTime && rightVal instanceof LocalDateTime) {
             return ((LocalDateTime) leftVal).isAfter((LocalDateTime) rightVal)
@@ -352,6 +387,9 @@ public class ZetaSQLFilter {
         if (leftVal == null || rightVal == null) {
             return false;
         }
+        if (leftVal instanceof OffsetDateTime && rightVal instanceof OffsetDateTime) {
+            return ((OffsetDateTime) leftVal).isBefore((OffsetDateTime) rightVal);
+        }
         if (leftVal instanceof LocalDateTime && rightVal instanceof LocalDateTime) {
             return ((LocalDateTime) leftVal).isBefore((LocalDateTime) rightVal);
         }
@@ -362,7 +400,9 @@ public class ZetaSQLFilter {
             return ((LocalTime) leftVal).isBefore((LocalTime) rightVal);
         }
         if (leftVal instanceof Number && rightVal instanceof Number) {
-            return ((Number) leftVal).doubleValue() < ((Number) rightVal).doubleValue();
+            return areExactNumbers(leftVal, rightVal)
+                    ? compareExactNumbers((Number) leftVal, (Number) rightVal) < 0
+                    : ((Number) leftVal).doubleValue() < ((Number) rightVal).doubleValue();
         }
         if (leftVal instanceof String && rightVal instanceof String) {
             return ((String) leftVal).compareTo((String) rightVal) < 0;
@@ -380,6 +420,10 @@ public class ZetaSQLFilter {
         if (leftVal == null || rightVal == null) {
             return false;
         }
+        if (leftVal instanceof OffsetDateTime && rightVal instanceof OffsetDateTime) {
+            return ((OffsetDateTime) leftVal).isBefore((OffsetDateTime) rightVal)
+                    || ((OffsetDateTime) leftVal).isEqual((OffsetDateTime) rightVal);
+        }
         if (leftVal instanceof LocalDateTime && rightVal instanceof LocalDateTime) {
             return ((LocalDateTime) leftVal).isBefore((LocalDateTime) rightVal)
                     || ((LocalDateTime) leftVal).isEqual((LocalDateTime) rightVal);
@@ -392,7 +436,9 @@ public class ZetaSQLFilter {
             return ((LocalTime) leftVal).isBefore((LocalTime) rightVal) || leftVal.equals(rightVal);
         }
         if (leftVal instanceof Number && rightVal instanceof Number) {
-            return ((Number) leftVal).doubleValue() <= ((Number) rightVal).doubleValue();
+            return areExactNumbers(leftVal, rightVal)
+                    ? compareExactNumbers((Number) leftVal, (Number) rightVal) <= 0
+                    : ((Number) leftVal).doubleValue() <= ((Number) rightVal).doubleValue();
         }
         if (leftVal instanceof String && rightVal instanceof String) {
             return ((String) leftVal).compareTo((String) rightVal) <= 0;
@@ -402,6 +448,34 @@ public class ZetaSQLFilter {
                 String.format(
                         "Filed types not matched, left is: %s, right is: %s ",
                         leftVal.getClass().getSimpleName(), rightVal.getClass().getSimpleName()));
+    }
+
+    private static boolean areExactNumbers(Object left, Object right) {
+        return isExactNumber(left) && isExactNumber(right);
+    }
+
+    /**
+     * Recognizes integral wrappers and BigDecimal. Float/Double and other Number subtypes
+     * (including BigInteger) retain the legacy double path. Callers use native floating operators,
+     * not Double.compare, to preserve NaN, infinity and signed-zero behavior.
+     */
+    private static boolean isExactNumber(Object value) {
+        return value instanceof Byte
+                || value instanceof Short
+                || value instanceof Integer
+                || value instanceof Long
+                || value instanceof BigDecimal;
+    }
+
+    /** Compares exact operands; callers must first establish {@link #areExactNumbers}. */
+    private static int compareExactNumbers(Number left, Number right) {
+        // Integral pairs need no allocation. Mixed decimal/integral pairs may allocate a BigDecimal
+        // per comparison (including each IN item) to preserve precision instead of using double.
+        if (left instanceof BigDecimal || right instanceof BigDecimal) {
+            return NumericFunction.toBigDecimal(left)
+                    .compareTo(NumericFunction.toBigDecimal(right));
+        }
+        return Long.compare(left.longValue(), right.longValue());
     }
 
     private boolean andExpr(AndExpression andExpression, Object[] inputFields) {

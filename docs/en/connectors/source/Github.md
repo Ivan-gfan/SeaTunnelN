@@ -6,289 +6,262 @@ import ChangeLog from '../changelog/connector-http-github.md';
 
 ## Description
 
-Used to read data from Github.
+The Github source connector reads data from the GitHub REST API. It is built on the HTTP source connector, and automatically adds the `Authorization: Bearer <access_token>` request header.
 
 ## Key features
 
 - [x] [batch](../../introduction/concepts/connector-v2-features.md)
-- [ ] [stream](../../introduction/concepts/connector-v2-features.md)
+- [x] [stream](../../introduction/concepts/connector-v2-features.md)
 - [ ] [exactly-once](../../introduction/concepts/connector-v2-features.md)
 - [ ] [column projection](../../introduction/concepts/connector-v2-features.md)
 - [ ] [parallelism](../../introduction/concepts/connector-v2-features.md)
 - [ ] [support user-defined split](../../introduction/concepts/connector-v2-features.md)
 
-## Options
+## Source Options
 
-|            name             |  type   | required | default value |
+| name                        | type    | required | default value |
 |-----------------------------|---------|----------|---------------|
 | url                         | String  | Yes      | -             |
-| access_token                | String  | No       | -             |
-| method                      | String  | No       | get           |
-| schema.fields               | Config  | No       | -             |
-| format                      | String  | No       | json          |
+| access_token                | String  | Yes      | -             |
+| method                      | String  | No       | GET           |
+| headers                     | Map     | No       | -             |
 | params                      | Map     | No       | -             |
 | body                        | String  | No       | -             |
+| format                      | String  | No       | text          |
+| schema                      | Config  | No       | -             |
+| schema.fields               | Config  | No       | -             |
 | json_field                  | Config  | No       | -             |
-| content_json                | String  | No       | -             |
+| content_field               | String  | No       | -             |
+| pageing                     | Config  | No       | -             |
+| pageing.page_type           | String  | No       | PageNumber    |
+| pageing.cursor_field        | String  | No       | -             |
+| pageing.cursor_response_field | String | No      | -             |
 | poll_interval_millis        | int     | No       | -             |
 | retry                       | int     | No       | -             |
 | retry_backoff_multiplier_ms | int     | No       | 100           |
 | retry_backoff_max_ms        | int     | No       | 10000         |
 | enable_multi_lines          | boolean | No       | false         |
+| keep_params_as_form         | boolean | No       | false         |
+| keep_page_param_as_http_param | boolean | No    | false         |
+| pageing.batch_size          | int     | No       | 100           |
+| pageing.start_page_number   | long    | No       | 1             |
+| pageing.total_page_size     | long    | No       | 0             |
+| pageing.use_placeholder_replacement | boolean | No | false         |
+| connect_timeout_ms          | int     | No       | 12000         |
+| socket_timeout_ms           | int     | No       | 60000         |
+| json_filed_missed_return_null | boolean | No     | false         |
 | common-options              | config  | No       | -             |
 
 ### url [String]
 
-http request url
+GitHub REST API URL, for example `https://api.github.com/orgs/apache/repos`.
 
 ### access_token [String]
 
-Github personal access token, see: [Creating a personal access token - GitHub Docs](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token)
+GitHub personal access token. The connector sends it as a Bearer token in the HTTP `Authorization` header.
 
 ### method [String]
 
-http request method, only supports GET, POST method
+HTTP request method. The common GitHub read scenario uses `GET`.
+
+### headers [Map]
+
+Extra HTTP headers. Do not put `Authorization` here unless you intentionally want to override the header generated from `access_token`.
 
 ### params [Map]
 
-http params
+HTTP query parameters, such as `per_page`, `page`, `since`, or other GitHub API parameters.
 
 ### body [String]
 
-http body
-
-### poll_interval_millis [int]
-
-request http api interval(millis) in stream mode
-
-### retry [int]
-
-The max retry times if request http return to `IOException`
-
-### retry_backoff_multiplier_ms [int]
-
-The retry-backoff times(millis) multiplier if request http failed
-
-### retry_backoff_max_ms [int]
-
-The maximum retry-backoff times(millis) if request http failed
+HTTP request body. This is only useful for API endpoints that accept a request body.
 
 ### format [String]
 
-the format of upstream data, now only support `json` `text`, default `json`.
-
-when you assign format is `json`, you should also assign schema option, for example:
-
-upstream data is the following:
-
-```json
-{
-  "code": 200,
-  "data": "get success",
-  "success": true
-}
-```
-
-you should assign schema as the following:
-
-```hocon
-
-schema {
-    fields {
-        code = int
-        data = string
-        success = boolean
-    }
-}
-
-```
-
-connector will generate data as the following:
-
-| code |    data     | success |
-|------|-------------|---------|
-| 200  | get success | true    |
-
-when you assign format is `text`, connector will do nothing for upstream data, for example:
-
-upstream data is the following:
-
-```json
-{
-  "code": 200,
-  "data": "get success",
-  "success": true
-}
-```
-
-connector will generate data as the following:
-
-|                         content                          |
-|----------------------------------------------------------|
-| {"code":  200, "data":  "get success", "success":  true} |
+Response format. Supports `json` and `text`. Use `json` with `schema` when you want SeaTunnel rows with named fields.
 
 ### schema [Config]
 
-#### fields [Config]
-
-the schema fields of upstream data
-
-### content_json [String]
-
-This parameter can get some json data.If you only need the data in the 'book' section, configure `content_field = "$.store.book.*"`.
-
-If your return data looks something like this.
-
-```json
-{
-  "store": {
-    "book": [
-      {
-        "category": "reference",
-        "author": "Nigel Rees",
-        "title": "Sayings of the Century",
-        "price": 8.95
-      },
-      {
-        "category": "fiction",
-        "author": "Evelyn Waugh",
-        "title": "Sword of Honour",
-        "price": 12.99
-      }
-    ],
-    "bicycle": {
-      "color": "red",
-      "price": 19.95
-    }
-  },
-  "expensive": 10
-}
-```
-
-You can configure `content_field = "$.store.book.*"` and the result returned looks like this:
-
-```json
-[
-  {
-    "category": "reference",
-    "author": "Nigel Rees",
-    "title": "Sayings of the Century",
-    "price": 8.95
-  },
-  {
-    "category": "fiction",
-    "author": "Evelyn Waugh",
-    "title": "Sword of Honour",
-    "price": 12.99
-  }
-]
-```
-
-Then you can get the desired result with a simpler schema,like
-
-```hocon
-Http {
-  url = "http://mockserver:1080/contentjson/mock"
-  method = "GET"
-  format = "json"
-  content_field = "$.store.book.*"
-  schema = {
-    fields {
-      category = string
-      author = string
-      title = string
-      price = string
-    }
-  }
-}
-```
-
-Here is an example:
-
-- Test data can be found at this link [mockserver-config.json](../../../../seatunnel-e2e/seatunnel-connector-v2-e2e/connector-http-e2e/src/test/resources/mockserver-config.json)
-- See this link for task configuration [http_contentjson_to_assert.conf](../../../../seatunnel-e2e/seatunnel-connector-v2-e2e/connector-http-e2e/src/test/resources/http_contentjson_to_assert.conf).
+Defines the output row structure when `format = "json"`. For details, see [Schema Feature](../../introduction/concepts/schema-feature.md).
 
 ### json_field [Config]
 
-This parameter helps you configure the schema,so this parameter must be used with schema.
+Maps output fields to JSONPath expressions. Use it with `schema` when the required values are nested in the response.
 
-If your data looks something like this:
+### content_field [String]
 
-```json
-{
-  "store": {
-    "book": [
-      {
-        "category": "reference",
-        "author": "Nigel Rees",
-        "title": "Sayings of the Century",
-        "price": 8.95
-      },
-      {
-        "category": "fiction",
-        "author": "Evelyn Waugh",
-        "title": "Sword of Honour",
-        "price": 12.99
+JSONPath expression used to select a JSON fragment before schema parsing, for example `$.items[*]`.
+
+### pageing [Config]
+
+Pagination settings inherited from the HTTP connector option rule. **These options are not applied by this connector**: `GithubSource` builds its reader without a pagination context, so the source always reads a single page regardless of `pageing` settings, and the job still succeeds. Do not rely on `pageing` here; passing more data requires connector support to be added.
+
+### pageing.page_type [String]
+
+Pagination type. Supported values are `PageNumber` (default) and `Cursor`. These options describe how pagination *would* be configured, but as noted above they are **not applied by this connector**, so the source reads a single page regardless of this setting.
+
+### pageing.cursor_field [String]
+
+The request parameter name that carries the cursor value. Used together with `pageing.page_type = "Cursor"`.
+
+### pageing.cursor_response_field [String]
+
+The JSONPath of the cursor in the response body. Used together with `pageing.page_type = "Cursor"`.
+
+### poll_interval_millis [int]
+
+Request interval in milliseconds for streaming jobs. In batch jobs the connector reads once and finishes.
+
+### retry [int]
+
+Maximum retry count when an HTTP request fails with `IOException`.
+
+### retry_backoff_multiplier_ms [int]
+
+Retry backoff multiplier in milliseconds.
+
+### retry_backoff_max_ms [int]
+
+Maximum retry backoff in milliseconds.
+
+### enable_multi_lines [boolean]
+
+When `true`, multiple JSON objects separated by newlines in the response body are treated as separate records.
+
+### keep_params_as_form [boolean]
+
+When `true`, request parameters are sent as form-encoded body parameters instead of URL query parameters.
+
+### keep_page_param_as_http_param [boolean]
+
+When `true`, the page parameter remains in the request URL when paginating instead of being replaced inside the body.
+
+### pageing.batch_size [int]
+
+The number of records returned per page request when the total number of pages is unknown.
+
+### pageing.start_page_number [long]
+
+Which page number to start synchronizing from.
+
+### pageing.total_page_size [long]
+
+Total page size to read. `0` means use `pageing.batch_size` until the API stops returning new pages.
+
+### pageing.use_placeholder_replacement [boolean]
+
+When `true`, use `${field}` placeholder replacement for headers, parameters and body values; otherwise use key-based replacement.
+
+### connect_timeout_ms [int]
+
+HTTP connection timeout in milliseconds. Default 12000ms.
+
+### socket_timeout_ms [int]
+
+HTTP socket timeout in milliseconds. Default 60000ms.
+
+### json_filed_missed_return_null [boolean]
+
+When `true`, missing JSON fields return `null`; otherwise a missing field causes an error.
+
+### common options
+
+Source plugin common parameters. See [Source Common Options](../common-options/source-common-options.md).
+
+## Usage Notes
+
+- `access_token` is sensitive. Avoid hardcoding real tokens in shared job files. Use SeaTunnel variable substitution or your deployment secret mechanism.
+- The connector always adds an `Authorization: Bearer <access_token>` header from `access_token`. Put other custom headers in `headers`.
+- Set `format = "json"` and define `schema` when you want typed SeaTunnel rows.
+- Use `content_field` when the GitHub response wraps records in a nested array such as `$.items[*]`.
+- This connector currently reads a single page only: the `pageing` options are accepted by the option rule but not applied by the reader (see the `pageing` section). Do not configure `params` with `page` / `per_page` expecting the connector to walk pages.
+
+## Task Examples
+
+### Read Repositories From A GitHub Organization
+
+```hocon
+env {
+  parallelism = 1
+  job.mode = "BATCH"
+}
+
+source {
+  Github {
+    url = "https://api.github.com/orgs/apache/repos"
+    access_token = "ghp_xxxxxxxxxxxx"
+    method = "GET"
+    format = "json"
+    schema = {
+      fields {
+        id = int
+        name = string
+        description = string
+        html_url = string
+        stargazers_count = int
+        forks = int
       }
-    ],
-    "bicycle": {
-      "color": "red",
-      "price": 19.95
     }
-  },
-  "expensive": 10
+  }
+}
+
+sink {
+  Console {
+  }
 }
 ```
 
-You can get the contents of 'book' by configuring the task as follows:
+### Read GitHub API Results (Single Page)
 
 ```hocon
+env {
+  parallelism = 1
+  job.mode = "BATCH"
+}
+
 source {
-  Http {
-    url = "http://mockserver:1080/jsonpath/mock"
+  Github {
+    url = "https://api.github.com/orgs/apache/repos"
+    access_token = "ghp_xxxxxxxxxxxx"
     method = "GET"
-    format = "json"
-    json_field = {
-      category = "$.store.book[*].category"
-      author = "$.store.book[*].author"
-      title = "$.store.book[*].title"
-      price = "$.store.book[*].price"
+    params = {
+      per_page = "100"
+      page = "1"
     }
+    format = "json"
     schema = {
       fields {
-        category = string
-        author = string
-        title = string
-        price = string
+        id = int
+        name = string
+        html_url = string
       }
     }
   }
 }
 ```
 
-- Test data can be found at this link [mockserver-config.json](../../../../seatunnel-e2e/seatunnel-connector-v2-e2e/connector-http-e2e/src/test/resources/mockserver-config.json)
-- See this link for task configuration [http_jsonpath_to_assert.conf](../../../../seatunnel-e2e/seatunnel-connector-v2-e2e/connector-http-e2e/src/test/resources/http_jsonpath_to_assert.conf).
-
-### common options
-
-Source plugin common parameters, please refer to [Source Common Options](../common-options/source-common-options.md) for details
-
-## Example
+### Stream GitHub Events
 
 ```hocon
-Github {
-  url = "https://api.github.com/orgs/apache/repos"
-  access_token = "xxxx"
-  method = "GET"
-  format = "json"
-  schema = {
-    fields {
-      id = int
-      name = string
-      description = string
-      html_url = string
-      stargazers_count = int
-      forks = int
+env {
+  parallelism = 1
+  job.mode = "STREAMING"
+  checkpoint.interval = 30000
+}
+
+source {
+  Github {
+    url = "https://api.github.com/orgs/apache/events"
+    access_token = "ghp_xxxxxxxxxxxx"
+    method = "GET"
+    format = "json"
+    poll_interval_millis = 60000
+    schema = {
+      fields {
+        id = string
+        type = string
+        created_at = string
+      }
     }
   }
 }
@@ -297,4 +270,3 @@ Github {
 ## Changelog
 
 <ChangeLog />
-

@@ -25,6 +25,7 @@ import org.apache.seatunnel.connectors.seatunnel.common.source.reader.RecordsWit
 import org.apache.seatunnel.connectors.seatunnel.common.source.reader.splitreader.SplitReader;
 import org.apache.seatunnel.connectors.seatunnel.common.source.reader.splitreader.SplitsAddition;
 import org.apache.seatunnel.connectors.seatunnel.common.source.reader.splitreader.SplitsChange;
+import org.apache.seatunnel.connectors.seatunnel.kafka.KafkaClientUtils;
 
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -102,27 +103,23 @@ public class KafkaPartitionSplitReader
         KafkaPartitionSplitRecords recordsBySplits =
                 new KafkaPartitionSplitRecords(consumerRecords);
         List<TopicPartition> finishedPartitions = new ArrayList<>();
-        for (TopicPartition tp : consumerRecords.partitions()) {
+        for (TopicPartition tp : consumer.assignment()) {
             long stoppingOffset = getStoppingOffset(tp);
-            final List<ConsumerRecord<byte[], byte[]>> recordsFromPartition =
-                    consumerRecords.records(tp);
+            if (stoppingOffset == Long.MAX_VALUE) {
+                continue;
+            }
+            long currentOffset =
+                    retryOnWakeup(
+                            () -> consumer.position(tp),
+                            "getting current position to finish split");
 
-            if (recordsFromPartition.size() > 0) {
-                final ConsumerRecord<byte[], byte[]> lastRecord =
-                        recordsFromPartition.get(recordsFromPartition.size() - 1);
-
-                // After processing a record with offset of "stoppingOffset - 1", the split reader
-                // should not continue fetching because the record with stoppingOffset may not
-                // exist. Keep polling will just block forever.
-                if (lastRecord.offset() >= stoppingOffset - 1) {
-                    recordsBySplits.setPartitionStoppingOffset(tp, stoppingOffset);
-                    finishSplitAtRecord(
-                            tp,
-                            stoppingOffset,
-                            lastRecord.offset(),
-                            finishedPartitions,
-                            recordsBySplits);
-                }
+            // Consumer positions advance across Kafka transaction control records, although those
+            // records are not returned by poll(). Use the position instead of the last returned
+            // record so a batch split can finish after consuming the visible records.
+            if (currentOffset >= stoppingOffset) {
+                recordsBySplits.setPartitionStoppingOffset(tp, stoppingOffset);
+                finishSplitAtRecord(
+                        tp, stoppingOffset, currentOffset, finishedPartitions, recordsBySplits);
             }
         }
 
@@ -130,6 +127,8 @@ public class KafkaPartitionSplitReader
 
         if (!finishedPartitions.isEmpty()) {
             unassignPartitions(finishedPartitions);
+            // Finished partitions no longer need retained split bounds.
+            finishedPartitions.forEach(stoppingOffsets::remove);
         }
 
         return recordsBySplits;
@@ -297,7 +296,7 @@ public class KafkaPartitionSplitReader
 
     @Override
     public void close() throws Exception {
-        consumer.close();
+        KafkaClientUtils.runWithConnectorClassLoader(consumer::close);
     }
 
     public void notifyCheckpointComplete(
@@ -306,43 +305,53 @@ public class KafkaPartitionSplitReader
         consumer.commitAsync(offsetsToCommit, offsetCommitCallback);
     }
 
+    /**
+     * Builds Kafka consumer properties for the source reader.
+     *
+     * <p>The source either relies on checkpoint-triggered commits or Kafka auto commit, but never
+     * both at the same time.
+     */
+    static Properties buildConsumerProperties(
+            KafkaSourceConfig kafkaSourceConfig, int subtaskId, String clientIdPrefix) {
+        Properties props = new Properties();
+        kafkaSourceConfig
+                .getProperties()
+                .forEach(
+                        (key, value) ->
+                                props.setProperty(String.valueOf(key), String.valueOf(value)));
+        props.setProperty(ConsumerConfig.GROUP_ID_CONFIG, kafkaSourceConfig.getConsumerGroup());
+        props.setProperty(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaSourceConfig.getBootstrap());
+        if (kafkaSourceConfig.getProperties().get("client.id") == null) {
+            props.setProperty(
+                    ConsumerConfig.CLIENT_ID_CONFIG, clientIdPrefix + "-consumer-" + subtaskId);
+        } else {
+            props.setProperty(
+                    ConsumerConfig.CLIENT_ID_CONFIG,
+                    kafkaSourceConfig.getProperties().get("client.id").toString()
+                            + "-"
+                            + subtaskId);
+        }
+        props.setProperty(
+                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+                ByteArrayDeserializer.class.getName());
+        props.setProperty(
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
+                ByteArrayDeserializer.class.getName());
+        props.setProperty(
+                ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG,
+                String.valueOf(!kafkaSourceConfig.isCommitOnCheckpoint()));
+        props.setProperty(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, "false");
+        return props;
+    }
+
     private KafkaConsumer<byte[], byte[]> initConsumer(
             KafkaSourceConfig kafkaSourceConfig, int subtaskId) {
 
         try (TemporaryClassLoaderContext ignored =
                 TemporaryClassLoaderContext.of(kafkaSourceConfig.getClass().getClassLoader())) {
-            Properties props = new Properties();
-            kafkaSourceConfig
-                    .getProperties()
-                    .forEach(
-                            (key, value) ->
-                                    props.setProperty(String.valueOf(key), String.valueOf(value)));
-            props.setProperty(ConsumerConfig.GROUP_ID_CONFIG, kafkaSourceConfig.getConsumerGroup());
-            props.setProperty(
-                    ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaSourceConfig.getBootstrap());
-            if (this.kafkaSourceConfig.getProperties().get("client.id") == null) {
-                props.setProperty(
-                        ConsumerConfig.CLIENT_ID_CONFIG,
-                        CLIENT_ID_PREFIX + "-consumer-" + subtaskId);
-            } else {
-                props.setProperty(
-                        ConsumerConfig.CLIENT_ID_CONFIG,
-                        this.kafkaSourceConfig.getProperties().get("client.id").toString()
-                                + "-"
-                                + subtaskId);
-            }
-            props.setProperty(
-                    ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
-                    ByteArrayDeserializer.class.getName());
-            props.setProperty(
-                    ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
-                    ByteArrayDeserializer.class.getName());
-            props.setProperty(
-                    ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG,
-                    String.valueOf(kafkaSourceConfig.isCommitOnCheckpoint()));
-
-            // Disable auto create topics feature
-            props.setProperty(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, "false");
+            Properties props =
+                    buildConsumerProperties(kafkaSourceConfig, subtaskId, CLIENT_ID_PREFIX);
             return new KafkaConsumer<>(props);
         }
     }

@@ -9,40 +9,49 @@ import ChangeLog from '../changelog/connector-elasticsearch.md';
 ## 主要特性
 
 - [ ] [精确一次](../../introduction/concepts/connector-v2-features.md)
-- [x] [cdc](../../introduction/concepts/connector-v2-features.md)
+- [x] [变更数据捕获](../../introduction/concepts/connector-v2-features.md)
+- [x] [支持多表写入](../../introduction/concepts/connector-v2-features.md)
+- [x] [定时刷新](../../introduction/concepts/connector-v2-features.md)
 
 :::tip
 
 引擎支持
 
-* 支持  `ElasticSearch 版本 >= 2.x 并且 <= 8.x`
+* 支持  `ElasticSearch 版本 >= 2.x 并且 <= 9.x`
 
 :::
 
 ## 选项
 
-|           名称            | 类型      | 是否必须 |             默认值              |
-|-------------------------|---------|------|------------------------------|
-| hosts                   | array   | 是    | -                            |
-| index                   | string  | 是    | -                            |
-| schema_save_mode        | string  | 是    | CREATE_SCHEMA_WHEN_NOT_EXIST |
-| data_save_mode          | string  | 是    | APPEND_DATA                  |
-| index_type              | string  | 否    |                              |
-| primary_keys            | list    | 否    |                              |
-| key_delimiter           | string  | 否    | `_`                          |
-| username                | string  | 否    |                              |
-| password                | string  | 否    |                              |
-| max_retry_count         | int     | 否    | 3                            |
-| max_batch_size          | int     | 否    | 10                           |
-| tls_verify_certificate  | boolean | 否    | true                         |
-| tls_verify_hostnames    | boolean | 否    | true                         |
-| tls_keystore_path       | string  | 否    | -                            |
-| tls_keystore_password   | string  | 否    | -                            |
-| tls_truststore_path     | string  | 否    | -                            |
+|           名称           | 类型      | 是否必须 |             默认值              |
+|------------------------|---------|------|------------------------------|
+| hosts                  | array   | 是    | -                            |
+| index                  | string  | 是    | -                            |
+| schema_save_mode       | string  | 否    | CREATE_SCHEMA_WHEN_NOT_EXIST |
+| data_save_mode         | string  | 否    | APPEND_DATA                  |
+| index_type             | string  | 否    |                              |
+| primary_keys           | list    | 否    |                              |
+| key_delimiter          | string  | 否    | `_`                          |
+| key_encoding           | enum    | 否    | LEGACY                       |
+| auth_type              | string  | 否    | basic                        |
+| username               | string  | 否    |                              |
+| password               | string  | 否    |                              |
+| auth.api_key_id        | string  | 否    | -                            |
+| auth.api_key           | string  | 否    | -                            |
+| auth.api_key_encoded   | string  | 否    | -                            |
+| max_retry_count        | int     | 否    | 3                            |
+| max_batch_size         | int     | 否    | 10                           |
+| tls_verify_certificate | boolean | 否    | true                         |
+| tls_verify_hostname    | boolean | 否    | true                         |
+| tls_keystore_path      | string  | 否    | -                            |
+| tls_keystore_password  | string  | 否    | -                            |
+| tls_truststore_path    | string  | 否    | -                            |
 | tls_truststore_password | string  | 否    | -                            |
-| common-options          |         | 否    | -                            |
-| vectorization_fields    | array   | 否    | -                            |
-| vector_dimensions       | int     | 否    | -                            |
+| common-options         |         | 否    | -                            |
+| vectorization_fields   | array   | 否    | -                            |
+| vector_dimensions      | int     | 否    | 0                            |
+| multi_table_sink_replica | int   | 否    | 1                            |
+
 
 ### hosts [array]
 
@@ -64,13 +73,96 @@ import ChangeLog from '../changelog/connector-elasticsearch.md';
 
 设定复合键的分隔符（默认为 `_`），例如，如果使用 `$` 作为分隔符，那么文档的 `_id` 将呈现为 `KEY1$KEY2$KEY3` 的格式
 
-### username [string]
+### key_encoding [enum]
 
-x-pack 用户名
+`LEGACY`（默认）保持现有文档 ID。当存在多个 `primary_keys` 时，如果主键值包含 `key_delimiter`，可能会生成相同的 ID。设为 `LENGTH_PREFIXED` 后，每个格式化后的值会编码为 `<长度>:<值>`；例如 `["1_1", "2"]` 会编码为 `3:1_11:2`，`["1", "1_2"]` 会编码为 `1:13:1_2`。该模式会忽略 `key_delimiter`，且单主键的 ID 保持不变。
 
-### password [string]
+对已有复合主键索引修改此选项会改变文档 ID，切换前需要重建索引或迁移已有文档，否则后续写入可能产生重复文档而不是更新旧 ID。
 
-x-pack 密码
+### multi_table_sink_replica [int]
+
+多表写入时，每张表对应的 Sink Writer 副本数。通常保持默认值即可；只有单表写入压力较大、需要更多写入并行度时再调大。
+
+## 认证
+
+Elasticsearch 连接器支持多种认证方式连接到安全的 Elasticsearch 集群。您可以根据 Elasticsearch 的安全配置选择合适的认证方式。
+
+### auth_type [enum]
+
+指定使用的认证方式。支持的值：
+- `basic`（默认）：使用用户名和密码的 HTTP 基本认证
+- `api_key`：使用独立的 ID 和密钥的 Elasticsearch API Key 认证
+- `api_key_encoded`：使用编码密钥的 Elasticsearch API Key 认证
+
+如果未指定，默认使用 `basic` 以保持向后兼容。
+
+### 基本认证
+
+基本认证使用 HTTP 基本认证，通过用户名和密码凭据进行认证。
+
+#### username [string]
+
+基本认证用户名（x-pack 用户名）。
+
+#### password [string]
+
+基本认证密码（x-pack 密码）。
+
+**示例：**
+```hocon
+sink {
+    Elasticsearch {
+        hosts = ["https://localhost:9200"]
+        auth_type = "basic"
+        username = "elastic"
+        password = "your_password"
+        index = "my_index"
+    }
+}
+```
+
+### API Key 认证
+
+API Key 认证提供了一种更安全的方式，使用 API 密钥对 Elasticsearch 进行认证。
+
+#### auth.api_key_id [string]
+
+Elasticsearch 生成的 API 密钥 ID。
+
+#### auth.api_key [string]
+
+Elasticsearch 生成的 API 密钥。
+
+#### auth.api_key_encoded [string]
+
+Base64 编码的 API 密钥，格式为 `base64(id:api_key)`。这是分别指定 `auth.api_key_id` 和 `auth.api_key` 的替代方式。
+
+**注意：** 可以使用 `auth.api_key_id` + `auth.api_key` 或 `auth.api_key_encoded`，但不能同时使用两者。
+
+**使用独立 ID 和密钥的示例：**
+```hocon
+sink {
+    Elasticsearch {
+        hosts = ["https://localhost:9200"]
+        auth_type = "api_key"
+        auth.api_key_id = "your_api_key_id"
+        auth.api_key = "your_api_key_secret"
+        index = "my_index"
+    }
+}
+```
+
+**使用编码密钥的示例：**
+```hocon
+sink {
+    Elasticsearch {
+        hosts = ["https://localhost:9200"]
+        auth_type = "api_key_encoded"
+        auth.api_key_encoded = "eW91cl9hcGlfa2V5X2lkOnlvdXJfYXBpX2tleV9zZWNyZXQ="
+        index = "my_index"
+    }
+}
+```
 
 ### max_retry_count [int]
 
@@ -131,6 +223,32 @@ Sink插件常用参数，请参考 [Sink常用选项](../common-options/sink-com
 `APPEND_DATA`：保留数据库结构，保留数据<br/>
 `ERROR_WHEN_DATA_EXISTS`：当有数据时抛出错误<br/>
 
+### Zeta 定时刷新
+
+该引擎级能力仅由 Zeta 支持，Spark 和 Flink 不会注入 `FlushSignal`。在 Zeta 中，可以在 `env` 块配置 `sink.flush.interval`，使未达到 `max_batch_size` 的待处理 bulk 请求也能定时写出。
+
+:::tip
+
+Elasticsearch 定时刷新不提供基于 2PC 的精确一次语义。Elasticsearch Sink 当前提供至少一次语义；如果文档 ID 不是确定性的，失败重试可能产生重复写入。
+
+:::
+
+```hocon
+env {
+  job.mode = "STREAMING"
+  checkpoint.interval = 300000
+  sink.flush.interval = 5000
+}
+
+sink {
+  Elasticsearch {
+    hosts = ["localhost:9200"]
+    index = "seatunnel-index"
+    max_batch_size = 10000
+  }
+}
+```
+
 ## 示例
 
 简单示例
@@ -153,6 +271,7 @@ sink {
         hosts = ["localhost:9200"]
         index = "${table_name}"
         schema_save_mode="IGNORE"
+        multi_table_sink_replica = 1
     }
 }
 ```
@@ -184,7 +303,6 @@ sink {
 }
 ```
 
-```
 变更数据捕获 (Change data capture) 事件多表写入
 
 ```conf

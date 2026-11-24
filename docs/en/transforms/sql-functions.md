@@ -94,6 +94,42 @@ Example:
 
 RAWTOHEX(DATA)
 
+### TO_BASE64
+
+```TO_BASE64(value[, charset]) -> STRING```
+
+Encodes a string or bytes to Base64.
+
+The default charset is `UTF-8`. You can specify another charset.
+
+For bytes input, the charset argument is not supported because the value is already raw bytes.
+
+Returns **NULL** if value is **NULL**.
+
+Example:
+
+TO_BASE64(NAME)
+
+TO_BASE64(NAME, 'UTF-16')
+
+TO_BASE64(BINARY_PAYLOAD)
+
+### FROM_BASE64
+
+```FROM_BASE64(value[, charset]) -> STRING```
+
+Decodes a Base64 string to text.
+
+The default charset is `UTF-8`. You can specify another charset.
+
+Returns **NULL** if value is **NULL**.
+
+Example:
+
+FROM_BASE64(ENCODED_NAME)
+
+FROM_BASE64(TO_BASE64(NAME, 'UTF-16'), 'UTF-16')
+
 ### INSERT
 
 ```INSERT(originalString, startInt, lengthInt, addString) -> STRING```
@@ -315,6 +351,17 @@ Example:
 MURMUR64('hello world')
 MURMUR64(NAME)
 
+### MD5
+
+```MD5(string|binary) -> STRING```
+
+Calculate the MD5 hash of the input string or binary value and return the result as a 32-character lowercase hexadecimal string, compatible with Hive's `md5` function. This method returns null if the input parameter is null.
+
+Example:
+
+MD5('hello world')
+MD5(NAME)
+
 ### SOUNDEX
 
 ```SOUNDEX(string) -> STRING```
@@ -396,6 +443,22 @@ ACOS(D)
 
 The MAX function returns the maximum value of the expression.
 
+For the `Sql` transform with `engine = ZETA` (the default) or `INTERNAL`, integral
+arrays (including BIGINT), DECIMAL arrays and mixtures of those values are
+compared without conversion to floating point. This applies on Zeta, Flink and
+Spark execution engines; the SQL engine option is separate from the execution
+engine. The result retains the selected
+element's type and, for DECIMAL, its scale. Null elements are ignored; a null,
+empty or all-null array returns null. Equal values retain the first element.
+FLOAT and DOUBLE arrays retain their existing ordering: NaN is greater than all
+other values, and positive zero is greater than negative zero.
+Arrays containing only Byte, Short, Integer and Long values use exact integral
+comparison. If BigDecimal is also present, those integral values are compared as
+exact decimals. If any Float, Double or other Number subtype (including
+BigInteger) is present, the whole array retains the existing double-based
+comparison and can lose precision for large or close values. This does not change
+array construction, declared element types or input coercion.
+
 Example:
 
 ARRAY_MAX(I)
@@ -405,6 +468,10 @@ ARRAY_MAX(I)
 ```ARRAY_MIN(ARRAY) -> type(array element)```
 
 The MIN function returns the minimum value of the expression.
+
+The `Sql` transform with `engine = ZETA` or `INTERNAL` uses the same precision,
+null handling and ordering rules as
+`ARRAY_MAX`, selecting the minimum element instead.
 
 Example:
 
@@ -429,6 +496,16 @@ Calculate the arc tangent. See also Java Math.atan.
 Example:
 
 ATAN(D)
+
+### ATAN2
+
+```ATAN2(numeric, numeric) -> DOUBLE```
+
+Calculate the arc tangent of the quotient of the two arguments. See also Java Math.atan2.
+
+Example:
+
+ATAN2(Y, X)
 
 ### COS
 
@@ -633,6 +710,8 @@ RAND()
 ```ROUND(numeric[, digitsInt]) -> NUMERIC (same type)```
 
 Rounds to a number of fractional digits. This method returns value of the same type as argument, but with adjusted precision and scale, if applicable.
+
+Note that when `digitsInt` is negative and the argument is an integral type, the rounded value can fall outside the range of that type. For example, ROUND(2147483647, -1) should be 2147483650, but this value is not allowed for the INT data type. It leads to an exception. To avoid it cast argument of this function to a higher data type. CEIL and FLOOR overflow the same way; TRUNC rounds toward zero and therefore cannot.
 
 Example:
 
@@ -889,22 +968,97 @@ MONTHNAME(CREATED)
 ### IS_DATE
 
 ```IS_DATE(string, formatString) -> BOOLEAN```
-Parses a string. The most important format characters are: y year, M month, d day, H hour, m minute, s second. For details of the format, see java.time.format.DateTimeFormatter.
+Validates whether a string can be parsed as a date/time value using the specified format pattern.
+
+**Supported Format Patterns:**
+
+DateTime Formats:
+- `yyyy-MM-dd HH:mm:ss` - Standard datetime format
+- `yyyy-MM-dd HH:mm:ss.SSS` - Datetime with milliseconds
+- `yyyy-MM-dd'T'HH:mm:ss` - ISO 8601 datetime format
+- `yyyy-MM-dd'T'HH:mm:ss.SSS` - ISO 8601 datetime with milliseconds
+- `yyyy/MM/dd HH:mm:ss` - Datetime with slash separator
+- `yyyy/MM/dd HH:mm:ss.SSS` - Datetime with slash separator and milliseconds
+- `yyyyMMddHHmmss` - Compact datetime format
+
+Date Formats:
+- `yyyy-MM-dd` - ISO 8601 date format
+- `yyyy/MM/dd` - Date with slash separator
+- `yyyyMMdd` - Compact date format
+
+Time Formats:
+- `HH:mm:ss` - Standard time format
+- `HH:mm:ss.SSS` - Time with milliseconds
+- `HHmmss` - Compact time format
 
 Example:
 
-CALL IS_DATE('2021-04-08 13:34:45','yyyy-MM-dd HH:mm:ss')
+```sql
+CALL IS_DATE('2021-04-08 13:34:45', 'yyyy-MM-dd HH:mm:ss')
+-- Returns true
+
+CALL IS_DATE('2021/04/08', 'yyyy/MM/dd')
+-- Returns true
+
+CALL IS_DATE('20210408', 'yyyyMMdd')
+-- Returns true
+
+-- Consistent with TO_DATE
+SELECT CASE
+  WHEN IS_DATE(date_string, 'yyyy-MM-dd HH:mm:ss')
+  THEN TO_DATE(date_string, 'yyyy-MM-dd HH:mm:ss')
+  ELSE NULL
+END as parsed_date
+```
 
 ### PARSEDATETIME / TO_DATE
 
-```PARSEDATETIME | TO_DATE(string, formatString) -> TIMESTAMP```
-Parses a string. The most important format characters are: y year, M month, d day, H hour, m minute, s second. For details of the format, see java.time.format.DateTimeFormatter.
+```PARSEDATETIME | TO_DATE(string, formatString) -> TIMESTAMP | DATE | TIME```
+Parses a string into a date/time value using the specified format pattern.
 
-Example:
+**Supported Format Patterns:**
 
-CALL PARSEDATETIME('2021-04-08 13:34:45','yyyy-MM-dd HH:mm:ss')
-CALL TO_DATE('2021-04-08'T'13:34:45','yyyy-MM-dd''T''HH:mm:ss')
-Note that when filling in `'` in SQL functions, it needs to be escaped to `''`.
+DateTime Formats (returns TIMESTAMP):
+- `yyyy-MM-dd HH:mm:ss` - Standard datetime format
+- `yyyy-MM-dd HH:mm:ss.SSS` - Datetime with milliseconds
+- `yyyy-MM-dd'T'HH:mm:ss` - ISO 8601 datetime format
+- `yyyy-MM-dd'T'HH:mm:ss.SSS` - ISO 8601 datetime with milliseconds
+- `yyyy/MM/dd HH:mm:ss` - Datetime with slash separator
+- `yyyy/MM/dd HH:mm:ss.SSS` - Datetime with slash separator and milliseconds
+- `yyyyMMddHHmmss` - Compact datetime format
+
+Date Formats (returns DATE):
+- `yyyy-MM-dd` - ISO 8601 date format
+- `yyyy/MM/dd` - Date with slash separator
+- `yyyyMMdd` - Compact date format
+
+Time Formats (returns TIME):
+- `HH:mm:ss` - Standard time format
+- `HH:mm:ss.SSS` - Time with milliseconds
+- `HHmmss` - Compact time format
+
+**Note:** When using single quotes (`'`) in format patterns (e.g., for ISO 8601 'T' separator), they must be escaped as `''` in SQL.
+
+Examples:
+
+```sql
+-- DateTime examples
+CALL PARSEDATETIME('2021-04-08 13:34:45', 'yyyy-MM-dd HH:mm:ss')
+CALL TO_DATE('2021-04-08T13:34:45', 'yyyy-MM-dd''T''HH:mm:ss')
+CALL PARSEDATETIME('2024-06-15 14:30:45.123', 'yyyy-MM-dd HH:mm:ss.SSS')
+CALL PARSEDATETIME('2021/04/08 13:34:45', 'yyyy/MM/dd HH:mm:ss')
+CALL PARSEDATETIME('20210408133445', 'yyyyMMddHHmmss')
+
+-- Date examples
+CALL TO_DATE('2021-04-08', 'yyyy-MM-dd')
+CALL TO_DATE('2021/04/08', 'yyyy/MM/dd')
+CALL TO_DATE('20210408', 'yyyyMMdd')
+
+-- Time examples
+CALL PARSEDATETIME('14:30:45', 'HH:mm:ss')
+CALL PARSEDATETIME('14:30:45.123', 'HH:mm:ss.SSS')
+CALL PARSEDATETIME('143045', 'HHmmss')
+```
 
 ### QUARTER
 
@@ -958,6 +1112,8 @@ Convert the number of seconds from the UNIX epoch (1970-01-01 00:00:00 UTC) to a
 
 The most important format characters are: y year, M month, d day, H hour, m minute, s second. For details of the format, see `java.time.format.DateTimeFormatter`.
 
+Text pattern letters (such as `MMM`, `EEE`) are interpreted in English, independent of the worker JVM locale.
+
 `timeZone` is optional, default value is system's time zone. `timezone` value can be a `UTC+ timezone offset`, for example, `UTC+8` represents the Asia/Shanghai time zone, see  https://en.wikipedia.org/wiki/List_of_tz_database_time_zones .
 
 
@@ -973,6 +1129,29 @@ or
 
 CALL FROM_UNIXTIME(1672502400, 'yyyy-MM-dd HH:mm:ss','UTC+6')
 
+### UNIX_TIMESTAMP
+
+```UNIX_TIMESTAMP() | UNIX_TIMESTAMP(string[, pattern]) | UNIX_TIMESTAMP(dateTime) -> BIGINT```
+
+Convert a datetime to the number of seconds since the UNIX epoch (1970-01-01 00:00:00 UTC). The inverse of `FROM_UNIXTIME`.
+
+- No argument: current epoch seconds.
+- String argument: parsed with the given `pattern` (default `yyyy-MM-dd HH:mm:ss`). For pattern characters see `java.time.format.DateTimeFormatter`.
+- `dateTime` argument: a TIMESTAMP / TIMESTAMP WITH TIME ZONE / DATE column.
+
+`dateTime` and string inputs are resolved against the system's time zone; a TIMESTAMP WITH TIME ZONE value uses its own offset. A string whose pattern carries a zone offset (for example `yyyy-MM-dd HH:mm:ssXXX`) uses that offset rather than the system time zone. Unparseable string input returns NULL rather than raising an error. An explicit NULL pattern or an invalid pattern string returns NULL for all input types. The `pattern` argument is only consulted for string input; it is ignored for typed datetime arguments. A pattern without a full date (for example `HH:mm:ss` or `yyyy-MM`) causes every row to return NULL, because the parser requires at least a date component. Numeric input is not supported and returns NULL; other non-temporal types (for example TIME, BOOLEAN, BYTES) raise an error. An out-of-range day-of-month (for example `2023-02-30`) is adjusted to the last valid day of that month, consistent with the other date-time functions. Unlike `FROM_UNIXTIME`, `UNIX_TIMESTAMP` does not accept a time zone argument. To convert a datetime in a specific time zone, use `AT TIME ZONE` to obtain a TIMESTAMP_TZ value first. If a user-defined function (UDF) with the same name exists, it is shadowed by this built-in. Text pattern letters (such as `MMM`, `EEE`) are interpreted in English, independent of the worker JVM locale.
+
+Example:
+
+select UNIX_TIMESTAMP('2023-01-01 00:00:00') as ts
+
+select UNIX_TIMESTAMP('2023/01/01 00:00:00', 'yyyy/MM/dd HH:mm:ss') as ts
+
+select UNIX_TIMESTAMP(dt) as ts
+
+-- convert a TIMESTAMP in a non-default time zone
+select UNIX_TIMESTAMP(dt AT TIME ZONE 'UTC+8') as ts
+
 ### AT TIME ZONE
 
 ```dateAndTime AT TIME ZONE 'timeZone' -> TIMESTAMP_TZ```
@@ -987,6 +1166,87 @@ local_date_time AT TIME ZONE '+09:00'
 
 offset_date_time AT TIME ZONE 'Pacific/Honolulu'
 
+## Crypto Functions
+
+### AES_ENCRYPT
+
+```AES_ENCRYPT(value, key[, iv]) -> STRING```
+
+Encrypts `value` with AES/CBC/PKCS5Padding and returns a Base64-encoded ciphertext. Returns **NULL** if `value` is **NULL**.
+
+- `value`: the plaintext to encrypt. Any non-null scalar value is converted to a string; array and map inputs are rejected.
+- `key`: the secret key. If it starts with `base64:`, the remainder is decoded as a raw AES key and must be 16, 24, or 32 bytes (AES-128/192/256); only this `base64:` form is wire-compatible with the `AesCbcEncryptor` used by the `FieldEncryptTransform`. Any other value is treated as a passphrase: it is hashed once with SHA-256 and the first 16 bytes are used as an AES-128 key, so arbitrary-length passphrases are supported. Passphrase mode is an unsalted fast KDF; for strong protection use a random `base64:` key and treat it as a secret. A `base64:` key and a passphrase are not interchangeable.
+- `iv`: optional initialization vector. If provided, its UTF-8 bytes are used as the IV and must be exactly 16 bytes; the returned ciphertext contains only the encrypted bytes and the caller is responsible for storing the IV. If omitted, a random 16-byte IV is generated per call and prepended to the ciphertext, so `AES_DECRYPT` can recover it without an explicit IV. An explicit `NULL` IV is rejected (omit the argument instead).
+
+Example:
+
+AES_ENCRYPT(name, 'mySecretPass')
+
+AES_ENCRYPT(name, 'mySecretPass', '1234567890123456')
+
+AES_ENCRYPT(name, 'base64:MTIzNDU2Nzg5MDEyMzQ1Ng==')
+
+SELECT AES_DECRYPT(AES_ENCRYPT(name, 'mySecretPass'), 'mySecretPass') AS name_enc FROM dual
+
+NOTE:
+- CBC is an unauthenticated mode: a wrong key or a corrupted ciphertext may (about once in 256) decrypt to garbage instead of throwing. Do not rely on a decryption error to detect a wrong key.
+- When `iv` is omitted the ciphertext is non-deterministic (a fresh random IV is generated for each call). To get a deterministic ciphertext, provide an explicit `iv`.
+
+### AES_DECRYPT
+
+```AES_DECRYPT(value, key[, iv]) -> STRING```
+
+Decrypts a Base64 AES/CBC/PKCS5Padding ciphertext. Returns **NULL** if `value` is **NULL**.
+
+- `value`: the Base64-encoded ciphertext produced by `AES_ENCRYPT`.
+- `key`: the secret key, with the same conventions as `AES_ENCRYPT`. It must match the key used for encryption.
+- `iv`: optional initialization vector. When omitted, the first 16 bytes of the decoded payload are treated as the IV (the format produced by `AES_ENCRYPT` without an IV). When provided, its UTF-8 bytes are used as the IV (must be 16 bytes) and the whole decoded payload is treated as the ciphertext. An explicit `NULL` IV is rejected.
+
+Example:
+
+AES_DECRYPT(cipher, 'mySecretPass')
+
+AES_DECRYPT(AES_ENCRYPT(name, 'mySecretPass'), 'mySecretPass')
+
+AES_DECRYPT(cipher, 'mySecretPass', '1234567890123456')
+
+## JSON Functions
+
+### GET_JSON_OBJECT
+
+```GET_JSON_OBJECT(json, path) -> STRING```
+
+Extracts a value from a JSON string using a JSON path and returns it as a string. Available in both the Zeta and Calcite SQL transforms.
+
+Supported path syntax:
+
+- `$` — the root document
+- `.field` — object field access
+- `[n]` — array index (non-negative integer)
+- `['field']` / `["field"]` — bracket field access (for keys containing `.` or `[`)
+
+Wildcards (`[*]`, `.*`), recursive descent (`..`) and filter expressions (`[?(...)]`) are not supported.
+
+Return semantics:
+
+- Any null input (`json` or `path`) → `null`
+- Invalid JSON → `null`
+- Path does not match / array index out of bounds → `null`
+- A JSON `null` value → `null`
+- A string value → the unquoted string content
+- A number or boolean → the value rendered as text
+- An object or array → the raw (compact) JSON text of that node
+
+Example:
+
+GET_JSON_OBJECT('{"a":"hello","b":[10,20]}', '$.a')
+
+GET_JSON_OBJECT('{"a":{"b":1}}', '$.a')
+
+GET_JSON_OBJECT('{"b":[10,20]}', '$.b[1]')
+
+SELECT CASE WHEN GET_JSON_OBJECT(name, '$.key1') = 'value1' THEN 'A' ELSE 'B' END AS r FROM dual
+
 ## System Functions
 
 ### CAST
@@ -995,7 +1255,7 @@ offset_date_time AT TIME ZONE 'Pacific/Honolulu'
 
 Converts a value to another data type.
 
-Supported data types: STRING | VARCHAR, TINYINT, SMALLINT, INT | INTEGER, LONG | BIGINT, BYTE, FLOAT, DOUBLE, DECIMAL(p,s), TIMESTAMP, DATE, TIME, BYTES, BOOLEAN
+Supported data types: STRING | VARCHAR, TINYINT, SMALLINT, INT | INTEGER, LONG | BIGINT, BYTE, FLOAT, DOUBLE, DECIMAL(p,s), TIMESTAMP | DATETIME, TIMESTAMP_TZ, DATE, TIME, BYTES | BINARY, BOOLEAN
 
 Example:
 * CAST(NAME AS INT)
@@ -1007,13 +1267,33 @@ Converts a value to a BOOLEAN data type according to the following rules:
 2. If the value can be interpreted as a numeric value (`1` or `0`), it returns `true` for `1` and `false` for `0`.
 3. If the value cannot be interpreted according to the above rules, it throws a `TransformException`.
 
+NOTE:
+Casting to `INT` | `INTEGER` throws a `TransformException` when the source value is outside the
+target's range, for example `CAST(3000000000 AS INT)`. `TINYINT` and `SMALLINT` behave the same way
+for a string source, such as `CAST('300' AS TINYINT)`. Use `TRY_CAST` to get `NULL` instead of an
+error.
+
+A narrowing or floating-point source is rejected earlier, while the statement is prepared rather
+than while a row is read: `CAST(double_col AS INT)` and `CAST(bigint_col AS TINYINT)` both fail with
+`Unsupported CAST FROM ... AS type: ...`, and `TRY_CAST` does not turn those into `NULL`. A
+fractional value reaches an integral target only through `COALESCE` or `IFNULL`, where the target
+type is inferred rather than written, and there it is truncated towards zero: when `int_col` is
+`NULL`, `COALESCE(int_col, double_col)` on `5.7` gives `5`.
+
+`BIGINT` | `LONG` is range-checked the same way, but only an overflowing string source reaches it as
+a cast, such as `CAST('9223372036854775808' AS BIGINT)`, where `TRY_CAST` returns `NULL`. A `DECIMAL`
+or `DOUBLE` source is refused while the statement is prepared, so it reaches `BIGINT` only through
+`COALESCE` or `IFNULL`: when `bigint_col` is `NULL`, `COALESCE(bigint_col, decimal_col)` on
+`18446744073709551616` now fails instead of returning `0`. `TRY_CAST` cannot turn that into `NULL`,
+because no cast is involved.
+
 ### TRY_CAST
 
 ```TRY_CAST(value as dataType) -> dataType | NULL```
 
 This function is similar to CAST, but when the conversion fails, it returns NULL instead of throwing an exception.
 
-Supported data types: STRING | VARCHAR, TINYINT, SMALLINT, INT | INTEGER, LONG | BIGINT, BYTE, FLOAT, DOUBLE, DECIMAL(p,s), TIMESTAMP, DATE, TIME, BYTES
+Supported data types: STRING | VARCHAR, TINYINT, SMALLINT, INT | INTEGER, LONG | BIGINT, BYTE, FLOAT, DOUBLE, DECIMAL(p,s), TIMESTAMP | DATETIME, TIMESTAMP_TZ, DATE, TIME, BYTES | BINARY, BOOLEAN
 
 Example:
 
@@ -1024,6 +1304,8 @@ TRY_CAST(NAME AS INT)
 ```COALESCE(aValue, bValue [,...]) -> type(of first non-null arg)```
 
 Returns the first value that is not null. If subsequent arguments have different data types from the first argument, they will be automatically converted to the type of the first argument.
+
+Because the target type comes from the first argument rather than the widest, a later argument is narrowed to it, so an out-of-range value now fails instead of wrapping. To keep the widest type, write the cast yourself: `COALESCE(CAST(int_col AS BIGINT), bigint_col)`. A `DECIMAL` or `DOUBLE` argument cannot be cast to `BIGINT` at all, so for those put the wider argument first instead, as in `COALESCE(decimal_col, bigint_col)`. Reordering is not a drop-in change though: it also changes which argument wins when both are non-null.
 
 Example:
 
@@ -1039,9 +1321,11 @@ SELECT COALESCE(A, B) as result FROM my_table
 
 ### IFNULL
 
-```IFNULL(aValue, bValue) -> type(common of args)```
+```IFNULL(aValue, bValue) -> type(of first non-null arg)```
 
 Returns the first value that is not null. If subsequent arguments have different data types from the first argument, they will be automatically converted to the type of the first argument.
+
+Because the target type comes from the first argument rather than the widest, a later argument is narrowed to it, so an out-of-range value now fails instead of wrapping. To keep the widest type, write the cast yourself: `IFNULL(CAST(int_col AS BIGINT), bigint_col)`. A `DECIMAL` or `DOUBLE` argument cannot be cast to `BIGINT` at all, so for those put the wider argument first instead, as in `IFNULL(decimal_col, bigint_col)`. Reordering is not a drop-in change though: it also changes which argument wins when both are non-null.
 
 Example:
 
@@ -1147,6 +1431,17 @@ select ARRAY(column1,column2,column3) as arrays
 
 notes: Currently only string, double, long, int types are supported
 
+### MAP
+
+```MAP<V> map(key1, value1, key2, value2, ...) -> MAP<K, V>```
+
+Create a map from alternating key/value arguments. The number of arguments must be even and keys cannot be NULL. Keys are converted to strings at runtime, but the declared key type of the result follows the key expressions' types, so prefer string key expressions; the declared value type follows the value expressions.
+
+Example:
+
+select MAP('a', 1, 'b', 2) as maps
+select MAP('k1', column1, 'k2', column2) as maps
+
 ### LATERAL VIEW
 #### EXPLODE
 ```EXPLODE(array of T) -> rows(value: T)``` 
@@ -1172,6 +1467,17 @@ SELECT * FROM dual
 ```
 
 ## Vector Functions
+
+`VECTOR_NORM`, `INNER_PRODUCT`, `COSINE_DISTANCE`, `L1_DISTANCE`, `L2_DISTANCE` and
+`VECTOR_NORMALIZE` perform intermediate products and differences in double precision
+for float vector elements. This avoids float overflow or underflow for finite large
+or small elements. `VECTOR_NORMALIZE` still returns float elements; rounding and
+underflow in the output representation remain possible. Null inputs and actual zero
+vectors retain their handling. No non-finite input validation or sanitization is
+added; corrected finite intermediates can also affect results when mixed with
+non-finite elements.
+
+Vector functions do not consume or modify their input vector buffers. The same vector field can be used in multiple expressions or as both arguments to a distance function, and remains available to downstream transforms and sinks.
 
 ### VECTOR_DIMS
 
@@ -1275,4 +1581,3 @@ Normalizes a vector to unit length (magnitude = 1). This is useful for computing
 ```sql
 SELECT id, VECTOR_NORMALIZE(embedding) as normalized_embedding FROM table
 ```
-

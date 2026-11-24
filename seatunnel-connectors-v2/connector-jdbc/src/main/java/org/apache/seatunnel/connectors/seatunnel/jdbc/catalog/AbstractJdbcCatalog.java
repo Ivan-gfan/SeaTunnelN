@@ -152,7 +152,7 @@ public abstract class AbstractJdbcCatalog implements Catalog {
             connectionMap.put(url, connection);
             return connection;
         } catch (SQLException e) {
-            throw new CatalogException(String.format("Failed connecting to %s via JDBC.", url), e);
+            throw new CatalogException("Failed connecting to the configured JDBC URL via JDBC.", e);
         }
     }
 
@@ -175,16 +175,26 @@ public abstract class AbstractJdbcCatalog implements Catalog {
 
     @Override
     public void close() throws CatalogException {
+        CatalogException closeException = null;
         for (Map.Entry<String, Connection> entry : connectionMap.entrySet()) {
             try {
                 entry.getValue().close();
             } catch (SQLException e) {
-                throw new CatalogException(
-                        String.format("Failed to close %s via JDBC.", entry.getKey()), e);
+                CatalogException currentException =
+                        new CatalogException(
+                                String.format("Failed to close %s via JDBC.", entry.getKey()), e);
+                if (closeException == null) {
+                    closeException = currentException;
+                } else {
+                    closeException.addSuppressed(currentException);
+                }
             }
         }
         connectionMap.clear();
         LOG.info("Catalog {} closing", catalogName);
+        if (closeException != null) {
+            throw closeException;
+        }
     }
 
     protected String getSelectColumnsSql(TablePath tablePath) {
@@ -232,7 +242,7 @@ public abstract class AbstractJdbcCatalog implements Catalog {
                     tableIdentifier,
                     tableSchemaBuilder.build(),
                     buildConnectorOptions(tablePath),
-                    Collections.emptyList(),
+                    getPartitionKeys(conn, tablePath),
                     comment.orElse(""),
                     catalogName);
 
@@ -252,6 +262,11 @@ public abstract class AbstractJdbcCatalog implements Catalog {
             buildColumnsWithErrorCheck(tablePath, resultSet, columnsBuilder);
         }
         return columnsBuilder;
+    }
+
+    protected List<String> getPartitionKeys(Connection connection, TablePath tablePath)
+            throws SQLException {
+        return Collections.emptyList();
     }
 
     protected void buildColumnsWithErrorCheck(
@@ -673,9 +688,22 @@ public abstract class AbstractJdbcCatalog implements Catalog {
         return CatalogUtils.getCatalogTable(defaultConnection, sqlQuery);
     }
 
+    /**
+     * Truncates the table on the connection of the database that the table path points to.
+     *
+     * <p>Most catalogs render the truncate DDL with schema and table only (no database qualifier),
+     * so the connection URL is what decides which database is truncated. A table path that carries
+     * an explicit database different from the catalog database must therefore be truncated through
+     * that database's URL, like the other DDL siblings in this class. A table path without a
+     * database keeps using the catalog default URL.
+     */
     protected void truncateTableInternal(TablePath tablePath) throws CatalogException {
+        String dbUrl =
+                StringUtils.isNotBlank(tablePath.getDatabaseName())
+                        ? getUrlFromDatabaseName(tablePath.getDatabaseName())
+                        : defaultUrl;
         try {
-            executeInternal(defaultUrl, getTruncateTableSql(tablePath));
+            executeInternal(dbUrl, getTruncateTableSql(tablePath));
         } catch (Exception e) {
             throw new CatalogException(
                     String.format(
